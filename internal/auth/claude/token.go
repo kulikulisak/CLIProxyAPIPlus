@@ -6,9 +6,10 @@ package claude
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/securefile"
 )
 
 // ClaudeTokenStorage stores OAuth2 token information for Anthropic Claude API authentication.
@@ -50,12 +51,23 @@ func (ts *ClaudeTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "claude"
 
-	data, err := json.Marshal(ts)
-	if err != nil {
-		return fmt.Errorf("failed to marshal token to json: %w", err)
+	// Create directory structure if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
 	}
-	if err := securefile.WriteAuthJSONFile(authFilePath, data); err != nil {
-		return fmt.Errorf("failed to write token file: %w", err)
+
+	// Create the token file
+	f, err := os.Create(authFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create token file: %w", err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	// Encode and write the token data as JSON
+	if err = json.NewEncoder(f).Encode(ts); err != nil {
+		return fmt.Errorf("failed to write token to file: %w", err)
 	}
 	return nil
 }

@@ -3,9 +3,10 @@ package iflow
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/securefile"
 )
 
 // IFlowTokenStorage persists iFlow OAuth credentials alongside the derived API key.
@@ -26,12 +27,18 @@ type IFlowTokenStorage struct {
 func (ts *IFlowTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "iflow"
-	data, err := json.Marshal(ts)
-	if err != nil {
-		return fmt.Errorf("iflow token: marshal token failed: %w", err)
+	if err := os.MkdirAll(filepath.Dir(authFilePath), 0o700); err != nil {
+		return fmt.Errorf("iflow token: create directory failed: %w", err)
 	}
-	if err := securefile.WriteAuthJSONFile(authFilePath, data); err != nil {
-		return fmt.Errorf("iflow token: write token failed: %w", err)
+
+	f, err := os.Create(authFilePath)
+	if err != nil {
+		return fmt.Errorf("iflow token: create file failed: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if err = json.NewEncoder(f).Encode(ts); err != nil {
+		return fmt.Errorf("iflow token: encode token failed: %w", err)
 	}
 	return nil
 }
