@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -251,86 +250,27 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 }
 
 func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
-	// OpenAI-style stream forwarding: write each SSE chunk and flush immediately.
-	// This guarantees clients see incremental output even for small responses.
-	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
-	var keepAlive *time.Ticker
-	var keepAliveC <-chan time.Time
-	if keepAliveInterval > 0 {
-		keepAlive = time.NewTicker(keepAliveInterval)
-		defer keepAlive.Stop()
-		keepAliveC = keepAlive.C
-	}
-	var terminalErr *interfaces.ErrorMessage
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			cancel(c.Request.Context().Err())
-			return
-
-		case chunk, ok := <-data:
-			if !ok {
-				// Prefer surfacing a terminal error if one is pending.
-				if terminalErr == nil {
-					select {
-					case errMsg, ok := <-errs:
-						if ok && errMsg != nil {
-							terminalErr = errMsg
-						}
-					default:
-					}
-				}
-				if terminalErr != nil {
-					status := http.StatusInternalServerError
-					if terminalErr.StatusCode > 0 {
-						status = terminalErr.StatusCode
-					}
-					c.Status(status)
-
-					errorBytes, _ := json.Marshal(h.toClaudeError(terminalErr))
-					_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
-					flusher.Flush()
-					cancel(terminalErr.Error)
-					return
-				}
-				flusher.Flush()
-				cancel(nil)
+	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		WriteChunk: func(chunk []byte) {
+			if len(chunk) == 0 {
 				return
 			}
-			if len(chunk) > 0 {
-				_, _ = c.Writer.Write(chunk)
-				flusher.Flush()
+			_, _ = c.Writer.Write(chunk)
+		},
+		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			if errMsg == nil {
+				return
 			}
+			status := http.StatusInternalServerError
+			if errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			c.Status(status)
 
-		case errMsg, ok := <-errs:
-			if !ok {
-				continue
-			}
-			if errMsg != nil {
-				terminalErr = errMsg
-				status := http.StatusInternalServerError
-				if errMsg.StatusCode > 0 {
-					status = errMsg.StatusCode
-				}
-				c.Status(status)
-
-				// An error occurred: emit as a proper SSE error event
-				errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
-				_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
-				flusher.Flush()
-			}
-
-			var execErr error
-			if errMsg != nil {
-				execErr = errMsg.Error
-			}
-			cancel(execErr)
-			return
-		case <-keepAliveC:
-			_, _ = fmt.Fprint(c.Writer, ": keep-alive\n\n")
-			flusher.Flush()
-		}
-	}
+			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+		},
+	})
 }
 
 type claudeErrorDetail struct {

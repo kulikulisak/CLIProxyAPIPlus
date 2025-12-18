@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -603,82 +602,27 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 	}
 }
 func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
-	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
-	var keepAlive *time.Ticker
-	var keepAliveC <-chan time.Time
-	if keepAliveInterval > 0 {
-		keepAlive = time.NewTicker(keepAliveInterval)
-		defer keepAlive.Stop()
-		keepAliveC = keepAlive.C
-	}
-	var terminalErr *interfaces.ErrorMessage
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			cancel(c.Request.Context().Err())
-			return
-		case chunk, ok := <-data:
-			if !ok {
-				// Drain an error if it arrived at the same time as stream close.
-				if terminalErr == nil {
-					select {
-					case errMsg, ok := <-errs:
-						if ok && errMsg != nil {
-							terminalErr = errMsg
-						}
-					default:
-					}
-				}
-				if terminalErr != nil {
-					status := http.StatusInternalServerError
-					if terminalErr.StatusCode > 0 {
-						status = terminalErr.StatusCode
-					}
-					errText := http.StatusText(status)
-					if terminalErr.Error != nil && terminalErr.Error.Error() != "" {
-						errText = terminalErr.Error.Error()
-					}
-					body := handlers.BuildErrorResponseBody(status, errText)
-					_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
-					flusher.Flush()
-					cancel(terminalErr.Error)
-					return
-				}
-
-				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
-				flusher.Flush()
-				cancel(nil)
+	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		WriteChunk: func(chunk []byte) {
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+		},
+		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			if errMsg == nil {
 				return
 			}
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
-			flusher.Flush()
-		case errMsg, ok := <-errs:
-			if !ok {
-				continue
+			status := http.StatusInternalServerError
+			if errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
 			}
-			if errMsg != nil {
-				terminalErr = errMsg
-				status := http.StatusInternalServerError
-				if errMsg.StatusCode > 0 {
-					status = errMsg.StatusCode
-				}
-				errText := http.StatusText(status)
-				if errMsg.Error != nil && errMsg.Error.Error() != "" {
-					errText = errMsg.Error.Error()
-				}
-				body := handlers.BuildErrorResponseBody(status, errText)
-				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
-				flusher.Flush()
+			errText := http.StatusText(status)
+			if errMsg.Error != nil && errMsg.Error.Error() != "" {
+				errText = errMsg.Error.Error()
 			}
-			var execErr error
-			if errMsg != nil {
-				execErr = errMsg.Error
-			}
-			cancel(execErr)
-			return
-		case <-keepAliveC:
-			_, _ = fmt.Fprint(c.Writer, ": keep-alive\n\n")
-			flusher.Flush()
-		}
-	}
+			body := handlers.BuildErrorResponseBody(status, errText)
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
+		},
+		WriteDone: func() {
+			_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+		},
+	})
 }
