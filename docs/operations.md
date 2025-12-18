@@ -334,6 +334,7 @@ pass-through:
     - path: "/v1/rerank"
       method: "POST"
       base-url: "https://api.openai.com"
+      timeout: 60
       headers:
         Authorization: "Bearer os.environ/OPENAI_API_KEY"
 ```
