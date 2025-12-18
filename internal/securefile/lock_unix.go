@@ -34,8 +34,13 @@ func WithLock(lockPath string, timeout time.Duration, fn func() error) error {
 
 	deadline := time.Now().Add(timeout)
 	for {
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
 			break
+		}
+		// EWOULDBLOCK/EAGAIN indicates the lock is held by another process.
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			return fmt.Errorf("securefile: unexpected error acquiring lock on %s: %w", lockPath, err)
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("securefile: timed out acquiring lock: %s", lockPath)
