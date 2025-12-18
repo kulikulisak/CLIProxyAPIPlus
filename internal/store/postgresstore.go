@@ -15,6 +15,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/securefile"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -140,6 +141,47 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	`, authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth table: %w", err)
 	}
+
+	spendTable := s.fullTableName("spend_logs")
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			request_id TEXT PRIMARY KEY,
+			api_key TEXT,
+			model TEXT,
+			prompt_tokens BIGINT,
+			completion_tokens BIGINT,
+			total_tokens BIGINT,
+			cost DOUBLE PRECISION,
+			requested_at TIMESTAMPTZ DEFAULT NOW(),
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS idx_spend_logs_api_key ON %s(api_key);
+		CREATE INDEX IF NOT EXISTS idx_spend_logs_requested_at ON %s(requested_at);
+	`, spendTable, spendTable, spendTable)); err != nil {
+		return fmt.Errorf("postgres store: create spend_logs table: %w", err)
+	}
+	return nil
+}
+
+// RecordSpendLog inserts a new spend log record into the database.
+func (s *PostgresStore) RecordSpendLog(ctx context.Context, requestID, apiKey, model string, promptTokens, completionTokens, totalTokens int64, cost float64, requestedAt time.Time) error {
+	query := fmt.Sprintf(`
+		INSERT INTO %s (request_id, api_key, model, prompt_tokens, completion_tokens, total_tokens, cost, requested_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, s.fullTableName("spend_logs"))
+	
+	if requestedAt.IsZero() {
+		requestedAt = time.Now()
+	}
+
+	// If requestID is empty, generate one
+	if requestID == "" {
+		requestID = fmt.Sprintf("req-%d", time.Now().UnixNano())
+	}
+
+	if _, err := s.db.ExecContext(ctx, query, requestID, apiKey, model, promptTokens, completionTokens, totalTokens, cost, requestedAt); err != nil {
+		return fmt.Errorf("postgres store: insert spend log: %w", err)
+	}
 	return nil
 }
 
@@ -222,19 +264,15 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		if errMarshal != nil {
 			return "", fmt.Errorf("postgres store: marshal metadata: %w", errMarshal)
 		}
-		if existing, errRead := os.ReadFile(path); errRead == nil {
+		if existing, _, errRead := securefile.ReadAuthJSONFile(path); errRead == nil {
 			if jsonEqual(existing, raw) {
 				return path, nil
 			}
 		} else if errRead != nil && !errors.Is(errRead, fs.ErrNotExist) {
 			return "", fmt.Errorf("postgres store: read existing metadata: %w", errRead)
 		}
-		tmp := path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("postgres store: write temp auth file: %w", errWrite)
-		}
-		if errRename := os.Rename(tmp, path); errRename != nil {
-			return "", fmt.Errorf("postgres store: rename auth file: %w", errRename)
+		if errWrite := securefile.WriteAuthJSONFile(path, raw); errWrite != nil {
+			return "", fmt.Errorf("postgres store: write auth file: %w", errWrite)
 		}
 	default:
 		return "", fmt.Errorf("postgres store: nothing to persist for %s", auth.ID)
@@ -285,7 +323,14 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			continue
 		}
 		metadata := make(map[string]any)
-		if err = json.Unmarshal([]byte(payload), &metadata); err != nil {
+		raw := []byte(payload)
+		decoded := raw
+		if plaintext, _, errDecode := securefile.DecodeAuthJSON(raw, securefile.CurrentAuthEncryption()); errDecode == nil {
+			decoded = plaintext
+		} else if errDecode != nil {
+			log.WithError(errDecode).Warnf("postgres store: auth %s decode failed; treating payload as raw json", id)
+		}
+		if err = json.Unmarshal(decoded, &metadata); err != nil {
 			log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
 			continue
 		}
@@ -381,7 +426,7 @@ func (s *PostgresStore) PersistConfig(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := os.ReadFile(s.configPath)
+	data, err := securefile.ReadFileRawLocked(s.configPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return s.deleteConfigRecord(ctx)
@@ -407,12 +452,12 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 				if errCreate := os.MkdirAll(filepath.Dir(s.configPath), 0o700); errCreate != nil {
 					return fmt.Errorf("postgres store: prepare config directory: %w", errCreate)
 				}
-				if errWrite := os.WriteFile(s.configPath, []byte{}, 0o600); errWrite != nil {
+				if errWrite := securefile.WriteFileRawLocked(s.configPath, []byte{}, 0o600); errWrite != nil {
 					return fmt.Errorf("postgres store: create empty config: %w", errWrite)
 				}
 			}
 		}
-		data, errRead := os.ReadFile(s.configPath)
+		data, errRead := securefile.ReadFileRawLocked(s.configPath)
 		if errRead != nil {
 			return fmt.Errorf("postgres store: read local config: %w", errRead)
 		}
@@ -426,7 +471,7 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 			return fmt.Errorf("postgres store: prepare config directory: %w", err)
 		}
 		normalized := normalizeLineEndings(content)
-		if err = os.WriteFile(s.configPath, []byte(normalized), 0o600); err != nil {
+		if err = securefile.WriteFileRawLocked(s.configPath, []byte(normalized), 0o600); err != nil {
 			return fmt.Errorf("postgres store: write config to spool: %w", err)
 		}
 	}
@@ -465,7 +510,7 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 		if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return fmt.Errorf("postgres store: create auth subdir: %w", err)
 		}
-		if err = os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		if err = securefile.WriteFileRawLocked(path, []byte(payload), 0o600); err != nil {
 			return fmt.Errorf("postgres store: write auth file: %w", err)
 		}
 	}
@@ -476,7 +521,7 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 }
 
 func (s *PostgresStore) syncAuthFile(ctx context.Context, relID, path string) error {
-	data, err := os.ReadFile(path)
+	data, err := securefile.ReadFileRawLocked(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return s.deleteAuthRecord(ctx, relID)
@@ -490,7 +535,7 @@ func (s *PostgresStore) syncAuthFile(ctx context.Context, relID, path string) er
 }
 
 func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string) error {
-	data, err := os.ReadFile(path)
+	data, err := securefile.ReadFileRawLocked(path)
 	if err != nil {
 		return fmt.Errorf("postgres store: read auth file: %w", err)
 	}
