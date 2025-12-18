@@ -182,6 +182,39 @@ func (h *GeminiCLIAPIHandler) handleInternalGenerateContent(c *gin.Context, rawJ
 }
 
 func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+	var keepAlive <-chan time.Time
+	var keepAliveTicker *time.Ticker
+	if alt == "" {
+		keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+		if keepAliveInterval > 0 {
+			keepAliveTicker = time.NewTicker(keepAliveInterval)
+			defer keepAliveTicker.Stop()
+			keepAlive = keepAliveTicker.C
+		}
+	}
+	var terminalErr *interfaces.ErrorMessage
+
+	writeTerminalErr := func(errMsg *interfaces.ErrorMessage) {
+		if errMsg == nil {
+			return
+		}
+		status := http.StatusInternalServerError
+		if errMsg.StatusCode > 0 {
+			status = errMsg.StatusCode
+		}
+		errText := http.StatusText(status)
+		if errMsg.Error != nil && errMsg.Error.Error() != "" {
+			errText = errMsg.Error.Error()
+		}
+		body := handlers.BuildErrorResponseBody(status, errText)
+		if alt == "" {
+			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
+		} else {
+			_, _ = c.Writer.Write(body)
+		}
+		flusher.Flush()
+	}
+
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -189,6 +222,21 @@ func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flus
 			return
 		case chunk, ok := <-data:
 			if !ok {
+				// Prefer surfacing a terminal error if one is pending.
+				if terminalErr == nil {
+					select {
+					case errMsg, ok := <-errs:
+						if ok && errMsg != nil {
+							terminalErr = errMsg
+						}
+					default:
+					}
+				}
+				if terminalErr != nil {
+					writeTerminalErr(terminalErr)
+					cancel(terminalErr.Error)
+					return
+				}
 				cancel(nil)
 				return
 			}
@@ -212,8 +260,8 @@ func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flus
 				continue
 			}
 			if errMsg != nil {
-				h.WriteErrorResponse(c, errMsg)
-				flusher.Flush()
+				terminalErr = errMsg
+				writeTerminalErr(errMsg)
 			}
 			var execErr error
 			if errMsg != nil {
@@ -221,7 +269,9 @@ func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flus
 			}
 			cancel(execErr)
 			return
-		case <-time.After(500 * time.Millisecond):
+		case <-keepAlive:
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
 		}
 	}
 }
