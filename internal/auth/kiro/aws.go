@@ -144,7 +144,7 @@ func ListKiroTokenFiles() ([]string, error) {
 	}
 
 	cacheDir := filepath.Join(homeDir, ".aws", "sso", "cache")
-	
+
 	// Check if directory exists
 	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
 		return nil, nil // No token files
@@ -267,7 +267,7 @@ func SanitizeEmailForFilename(email string) string {
 	}
 
 	result := email
-	
+
 	// First, handle URL-encoded path traversal attempts (%2F, %2E, %5C, etc.)
 	// This prevents encoded characters from bypassing the sanitization.
 	// Note: We replace % last to catch any remaining encodings including double-encoding (%252F)
@@ -285,7 +285,7 @@ func SanitizeEmailForFilename(email string) string {
 	for _, char := range []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|", " ", "\x00"} {
 		result = strings.ReplaceAll(result, char, "_")
 	}
-	
+
 	// Prevent path traversal: replace leading dots in each path component
 	// This handles cases like "../../../etc/passwd" → "_.._.._.._etc_passwd"
 	parts := strings.Split(result, "_")
@@ -296,6 +296,6 @@ func SanitizeEmailForFilename(email string) string {
 		parts[i] = part
 	}
 	result = strings.Join(parts, "_")
-	
+
 	return result
 }

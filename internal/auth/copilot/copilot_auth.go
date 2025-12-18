@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/oauthhttp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -22,11 +23,11 @@ const (
 	copilotAPIEndpoint = "https://api.githubcopilot.com"
 
 	// Common HTTP header values for Copilot API requests.
-	copilotUserAgent       = "GithubCopilot/1.0"
-	copilotEditorVersion   = "vscode/1.100.0"
-	copilotPluginVersion   = "copilot/1.300.0"
-	copilotIntegrationID   = "vscode-chat"
-	copilotOpenAIIntent    = "conversation-panel"
+	copilotUserAgent     = "GithubCopilot/1.0"
+	copilotEditorVersion = "vscode/1.100.0"
+	copilotPluginVersion = "copilot/1.300.0"
+	copilotIntegrationID = "vscode-chat"
+	copilotOpenAIIntent  = "conversation-panel"
 )
 
 // CopilotAPIToken represents the Copilot API token response.
@@ -62,7 +63,7 @@ type CopilotAuth struct {
 // It initializes an HTTP client with proxy settings from the provided configuration.
 func NewCopilotAuth(cfg *config.Config) *CopilotAuth {
 	return &CopilotAuth{
-		httpClient:   util.SetProxy(&cfg.SDKConfig, &http.Client{Timeout: 30 * time.Second}),
+		httpClient:   util.SetOAuthProxy(&cfg.SDKConfig, &http.Client{Timeout: 30 * time.Second}),
 		deviceClient: NewDeviceFlowClient(cfg),
 		cfg:          cfg,
 	}
@@ -100,36 +101,35 @@ func (c *CopilotAuth) GetCopilotAPIToken(ctx context.Context, githubAccessToken 
 	if githubAccessToken == "" {
 		return nil, NewAuthenticationError(ErrTokenExchangeFailed, fmt.Errorf("github access token is empty"))
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotAPITokenURL, nil)
+	status, _, bodyBytes, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotAPITokenURL, nil)
+			if err != nil {
+				return nil, NewAuthenticationError(ErrTokenExchangeFailed, err)
+			}
+
+			req.Header.Set("Authorization", "token "+githubAccessToken)
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", copilotUserAgent)
+			req.Header.Set("Editor-Version", copilotEditorVersion)
+			req.Header.Set("Editor-Plugin-Version", copilotPluginVersion)
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
 	if err != nil {
 		return nil, NewAuthenticationError(ErrTokenExchangeFailed, err)
 	}
 
-	req.Header.Set("Authorization", "token "+githubAccessToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", copilotUserAgent)
-	req.Header.Set("Editor-Version", copilotEditorVersion)
-	req.Header.Set("Editor-Plugin-Version", copilotPluginVersion)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, NewAuthenticationError(ErrTokenExchangeFailed, err)
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("copilot api token: close body error: %v", errClose)
-		}
-	}()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, NewAuthenticationError(ErrTokenExchangeFailed, err)
-	}
-
-	if !isHTTPSuccess(resp.StatusCode) {
+	if !isHTTPSuccess(status) {
 		return nil, NewAuthenticationError(ErrTokenExchangeFailed,
-			fmt.Errorf("status %d: %s", resp.StatusCode, string(bodyBytes)))
+			fmt.Errorf("status %d: %s", status, string(bodyBytes)))
 	}
 
 	var apiToken CopilotAPIToken

@@ -41,10 +41,11 @@ func (a GitHubCopilotAuthenticator) Login(ctx context.Context, cfg *config.Confi
 	}
 
 	authSvc := copilot.NewCopilotAuth(cfg)
+	deviceProvider := copilot.NewDeviceOAuthProvider(cfg)
 
 	// Start the device flow
 	fmt.Println("Starting GitHub Copilot authentication...")
-	deviceCode, err := authSvc.StartDeviceFlow(ctx)
+	deviceCode, err := deviceProvider.DeviceAuthorize(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("github-copilot: failed to start device flow: %w", err)
 	}
@@ -66,29 +67,55 @@ func (a GitHubCopilotAuthenticator) Login(ctx context.Context, cfg *config.Confi
 	fmt.Printf("(This will timeout in %d seconds if not authorized)\n", deviceCode.ExpiresIn)
 
 	// Wait for user authorization
-	authBundle, err := authSvc.WaitForAuthorization(ctx, deviceCode)
+	tokenResult, err := deviceProvider.DevicePoll(ctx, deviceCode)
 	if err != nil {
 		errMsg := copilot.GetUserFriendlyMessage(err)
 		return nil, fmt.Errorf("github-copilot: %s", errMsg)
 	}
+	if tokenResult == nil || tokenResult.AccessToken == "" {
+		return nil, fmt.Errorf("github-copilot: missing access token")
+	}
+
+	username := "unknown"
+	if ok, fetchedUsername, errValidate := authSvc.ValidateToken(ctx, tokenResult.AccessToken); errValidate == nil && ok {
+		if fetchedUsername != "" {
+			username = fetchedUsername
+		}
+	} else if errValidate != nil {
+		log.Warnf("github-copilot: failed to fetch user info: %v", errValidate)
+	}
 
 	// Verify the token can get a Copilot API token
 	fmt.Println("Verifying Copilot access...")
-	apiToken, err := authSvc.GetCopilotAPIToken(ctx, authBundle.TokenData.AccessToken)
+	apiToken, err := authSvc.GetCopilotAPIToken(ctx, tokenResult.AccessToken)
 	if err != nil {
 		return nil, fmt.Errorf("github-copilot: failed to verify Copilot access - you may not have an active Copilot subscription: %w", err)
 	}
 
 	// Create the token storage
-	tokenStorage := authSvc.CreateTokenStorage(authBundle)
+	scope := ""
+	if tokenResult.Metadata != nil {
+		if raw, ok := tokenResult.Metadata["scope"]; ok {
+			if val, okStr := raw.(string); okStr {
+				scope = val
+			}
+		}
+	}
+	tokenStorage := &copilot.CopilotTokenStorage{
+		AccessToken: tokenResult.AccessToken,
+		TokenType:   tokenResult.TokenType,
+		Scope:       scope,
+		Username:    username,
+		Type:        "github-copilot",
+	}
 
 	// Build metadata with token information for the executor
 	metadata := map[string]any{
 		"type":         "github-copilot",
-		"username":     authBundle.Username,
-		"access_token": authBundle.TokenData.AccessToken,
-		"token_type":   authBundle.TokenData.TokenType,
-		"scope":        authBundle.TokenData.Scope,
+		"username":     username,
+		"access_token": tokenResult.AccessToken,
+		"token_type":   tokenResult.TokenType,
+		"scope":        scope,
 		"timestamp":    time.Now().UnixMilli(),
 	}
 
@@ -96,15 +123,15 @@ func (a GitHubCopilotAuthenticator) Login(ctx context.Context, cfg *config.Confi
 		metadata["api_token_expires_at"] = apiToken.ExpiresAt
 	}
 
-	fileName := fmt.Sprintf("github-copilot-%s.json", authBundle.Username)
+	fileName := fmt.Sprintf("github-copilot-%s.json", username)
 
-	fmt.Printf("\nGitHub Copilot authentication successful for user: %s\n", authBundle.Username)
+	fmt.Printf("\nGitHub Copilot authentication successful for user: %s\n", username)
 
 	return &coreauth.Auth{
 		ID:       fileName,
 		Provider: a.Provider(),
 		FileName: fileName,
-		Label:    authBundle.Username,
+		Label:    username,
 		Storage:  tokenStorage,
 		Metadata: metadata,
 	}, nil

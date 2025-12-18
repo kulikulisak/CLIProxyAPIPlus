@@ -3,8 +3,8 @@ package kiro
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/securefile"
 )
 
 // KiroTokenStorage holds the persistent token data for Kiro authentication.
@@ -27,17 +27,12 @@ type KiroTokenStorage struct {
 
 // SaveTokenToFile persists the token storage to the specified file path.
 func (s *KiroTokenStorage) SaveTokenToFile(authFilePath string) error {
-	dir := filepath.Dir(authFilePath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	data, err := json.MarshalIndent(s, "", "  ")
+	data, err := json.Marshal(s)
 	if err != nil {
 		return fmt.Errorf("failed to marshal token storage: %w", err)
 	}
 
-	if err := os.WriteFile(authFilePath, data, 0600); err != nil {
+	if err := securefile.WriteAuthJSONFile(authFilePath, data); err != nil {
 		return fmt.Errorf("failed to write token file: %w", err)
 	}
 
@@ -46,7 +41,7 @@ func (s *KiroTokenStorage) SaveTokenToFile(authFilePath string) error {
 
 // LoadFromFile loads token storage from the specified file path.
 func LoadFromFile(authFilePath string) (*KiroTokenStorage, error) {
-	data, err := os.ReadFile(authFilePath)
+	data, _, err := securefile.ReadAuthJSONFile(authFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token file: %w", err)
 	}
