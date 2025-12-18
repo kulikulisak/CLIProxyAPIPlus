@@ -97,7 +97,7 @@ cache:
 - Applies to:
   - `POST /v1/chat/completions`
   - `POST /v1/completions`
-  - `POST /v1/responses`
+  - `POST /v1/responses` (OpenAI Responses API)
   - `POST /v1/messages`
 
 ### Cache key
@@ -208,7 +208,7 @@ Additional strategies:
 
 ### Fill-first spillover (recommended for “many creds”)
 
-`fill-first` intentionally “burns” one account first (to stagger rolling-window subscription caps), but with many concurrent terminals it can also hammer a single credential into avoidable `429`s. These knobs keep the intent while adding safe spillover:
+`fill-first` intentionally “burns” one account first (to stagger rolling-window subscription caps), but with many concurrent terminals it can also overload a single credential, leading to avoidable `429` errors. These knobs keep the intent while adding safe spillover:
 
 ```yaml
 routing:
