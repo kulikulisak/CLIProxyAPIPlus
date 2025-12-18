@@ -5,15 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/oauthflow"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/oauthhttp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -41,7 +41,7 @@ type DeviceFlowClient struct {
 func NewDeviceFlowClient(cfg *config.Config) *DeviceFlowClient {
 	client := &http.Client{Timeout: 30 * time.Second}
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		client = util.SetOAuthProxy(&cfg.SDKConfig, client)
 	}
 	return &DeviceFlowClient{
 		httpClient: client,
@@ -51,34 +51,45 @@ func NewDeviceFlowClient(cfg *config.Config) *DeviceFlowClient {
 
 // RequestDeviceCode initiates the device flow by requesting a device code from GitHub.
 func (c *DeviceFlowClient) RequestDeviceCode(ctx context.Context) (*DeviceCodeResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	data := url.Values{}
 	data.Set("client_id", copilotClientID)
 	data.Set("scope", "user:email")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, copilotDeviceCodeURL, strings.NewReader(data.Encode()))
-	if err != nil {
+	encoded := data.Encode()
+	status, _, bodyBytes, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, copilotDeviceCodeURL, strings.NewReader(encoded))
+			if err != nil {
+				return nil, NewAuthenticationError(ErrDeviceCodeFailed, err)
+			}
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Accept", "application/json")
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, NewAuthenticationError(ErrDeviceCodeFailed, err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, NewAuthenticationError(ErrDeviceCodeFailed, err)
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("copilot device code: close body error: %v", errClose)
+	if !isHTTPSuccess(status) {
+		msg := strings.TrimSpace(string(bodyBytes))
+		if err != nil {
+			return nil, NewAuthenticationError(ErrDeviceCodeFailed, fmt.Errorf("status %d: %s: %w", status, msg, err))
 		}
-	}()
-
-	if !isHTTPSuccess(resp.StatusCode) {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, NewAuthenticationError(ErrDeviceCodeFailed, fmt.Errorf("status %d: %s", resp.StatusCode, string(bodyBytes)))
+		return nil, NewAuthenticationError(ErrDeviceCodeFailed, fmt.Errorf("status %d: %s", status, msg))
+	}
+	if err != nil {
+		return nil, NewAuthenticationError(ErrDeviceCodeFailed, err)
 	}
 
 	var deviceCode DeviceCodeResponse
-	if err = json.NewDecoder(resp.Body).Decode(&deviceCode); err != nil {
+	if err = json.Unmarshal(bodyBytes, &deviceCode); err != nil {
 		return nil, NewAuthenticationError(ErrDeviceCodeFailed, err)
 	}
 
@@ -90,84 +101,118 @@ func (c *DeviceFlowClient) PollForToken(ctx context.Context, deviceCode *DeviceC
 	if deviceCode == nil {
 		return nil, NewAuthenticationError(ErrTokenExchangeFailed, fmt.Errorf("device code is nil"))
 	}
-
-	interval := time.Duration(deviceCode.Interval) * time.Second
-	if interval < defaultPollInterval {
-		interval = defaultPollInterval
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	deadline := time.Now().Add(maxPollDuration)
-	if deviceCode.ExpiresIn > 0 {
-		codeDeadline := time.Now().Add(time.Duration(deviceCode.ExpiresIn) * time.Second)
-		if codeDeadline.Before(deadline) {
-			deadline = codeDeadline
+	interval := deviceCode.Interval
+	if interval <= 0 || time.Duration(interval)*time.Second < defaultPollInterval {
+		interval = int(defaultPollInterval / time.Second)
+	}
+
+	device := &oauthflow.DeviceCodeResult{
+		DeviceCode:      strings.TrimSpace(deviceCode.DeviceCode),
+		UserCode:        strings.TrimSpace(deviceCode.UserCode),
+		VerificationURI: strings.TrimSpace(deviceCode.VerificationURI),
+		ExpiresIn:       deviceCode.ExpiresIn,
+		Interval:        interval,
+	}
+
+	token, err := oauthflow.PollDeviceToken(ctx, device, func(pollCtx context.Context) (*oauthflow.TokenResult, error) {
+		resp, err := c.exchangeDeviceCode(pollCtx, device.DeviceCode)
+		if err == nil {
+			meta := map[string]any{}
+			if strings.TrimSpace(resp.Scope) != "" {
+				meta["scope"] = resp.Scope
+			}
+			tokenType := strings.TrimSpace(resp.TokenType)
+			if tokenType == "" {
+				tokenType = "bearer"
+			}
+			return &oauthflow.TokenResult{
+				AccessToken: resp.AccessToken,
+				TokenType:   tokenType,
+				Metadata:    meta,
+			}, nil
+		}
+
+		var authErr *AuthenticationError
+		if errors.As(err, &authErr) {
+			switch authErr.Type {
+			case ErrAuthorizationPending.Type:
+				return nil, oauthflow.ErrAuthorizationPending
+			case ErrSlowDown.Type:
+				return nil, oauthflow.ErrSlowDown
+			case ErrDeviceCodeExpired.Type:
+				return nil, oauthflow.ErrDeviceCodeExpired
+			case ErrAccessDenied.Type:
+				return nil, oauthflow.ErrAccessDenied
+			}
+		}
+		return nil, err
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, oauthflow.ErrPollingTimeout),
+			errors.Is(err, context.DeadlineExceeded),
+			errors.Is(err, context.Canceled):
+			return nil, NewAuthenticationError(ErrPollingTimeout, err)
+		case errors.Is(err, oauthflow.ErrDeviceCodeExpired):
+			return nil, ErrDeviceCodeExpired
+		case errors.Is(err, oauthflow.ErrAccessDenied):
+			return nil, ErrAccessDenied
+		}
+		return nil, err
+	}
+	if token == nil {
+		return nil, NewAuthenticationError(ErrTokenExchangeFailed, fmt.Errorf("token result is nil"))
+	}
+
+	scope := ""
+	if token.Metadata != nil {
+		if raw, ok := token.Metadata["scope"]; ok {
+			if val, okStr := raw.(string); okStr {
+				scope = strings.TrimSpace(val)
+			}
 		}
 	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, NewAuthenticationError(ErrPollingTimeout, ctx.Err())
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				return nil, ErrPollingTimeout
-			}
-
-			token, err := c.exchangeDeviceCode(ctx, deviceCode.DeviceCode)
-			if err != nil {
-				var authErr *AuthenticationError
-				if errors.As(err, &authErr) {
-					switch authErr.Type {
-					case ErrAuthorizationPending.Type:
-						// Continue polling
-						continue
-					case ErrSlowDown.Type:
-						// Increase interval and continue
-						interval += 5 * time.Second
-						ticker.Reset(interval)
-						continue
-					case ErrDeviceCodeExpired.Type:
-						return nil, err
-					case ErrAccessDenied.Type:
-						return nil, err
-					}
-				}
-				return nil, err
-			}
-			return token, nil
-		}
+	tokenType := strings.TrimSpace(token.TokenType)
+	if tokenType == "" {
+		tokenType = "bearer"
 	}
+	return &CopilotTokenData{
+		AccessToken: token.AccessToken,
+		TokenType:   tokenType,
+		Scope:       scope,
+	}, nil
 }
 
 // exchangeDeviceCode attempts to exchange the device code for an access token.
 func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode string) (*CopilotTokenData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	data := url.Values{}
 	data.Set("client_id", copilotClientID)
 	data.Set("device_code", deviceCode)
 	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, copilotTokenURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, NewAuthenticationError(ErrTokenExchangeFailed, err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, NewAuthenticationError(ErrTokenExchangeFailed, err)
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("copilot token exchange: close body error: %v", errClose)
-		}
-	}()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
+	encoded := data.Encode()
+	status, _, bodyBytes, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, copilotTokenURL, strings.NewReader(encoded))
+			if err != nil {
+				return nil, NewAuthenticationError(ErrTokenExchangeFailed, err)
+			}
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Accept", "application/json")
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, NewAuthenticationError(ErrTokenExchangeFailed, err)
 	}
 
@@ -196,7 +241,7 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode st
 		case "access_denied":
 			return nil, ErrAccessDenied
 		default:
-			return nil, NewOAuthError(oauthResp.Error, oauthResp.ErrorDescription, resp.StatusCode)
+			return nil, NewOAuthError(oauthResp.Error, oauthResp.ErrorDescription, status)
 		}
 	}
 
@@ -216,34 +261,44 @@ func (c *DeviceFlowClient) FetchUserInfo(ctx context.Context, accessToken string
 	if accessToken == "" {
 		return "", NewAuthenticationError(ErrUserInfoFailed, fmt.Errorf("access token is empty"))
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotUserInfoURL, nil)
-	if err != nil {
+	status, _, bodyBytes, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotUserInfoURL, nil)
+			if err != nil {
+				return nil, NewAuthenticationError(ErrUserInfoFailed, err)
+			}
+			req.Header.Set("Authorization", "Bearer "+accessToken)
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", "CLIProxyAPI")
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return "", NewAuthenticationError(ErrUserInfoFailed, err)
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "CLIProxyAPI")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", NewAuthenticationError(ErrUserInfoFailed, err)
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("copilot user info: close body error: %v", errClose)
+	if !isHTTPSuccess(status) {
+		msg := strings.TrimSpace(string(bodyBytes))
+		if err != nil {
+			return "", NewAuthenticationError(ErrUserInfoFailed, fmt.Errorf("status %d: %s: %w", status, msg, err))
 		}
-	}()
-
-	if !isHTTPSuccess(resp.StatusCode) {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", NewAuthenticationError(ErrUserInfoFailed, fmt.Errorf("status %d: %s", resp.StatusCode, string(bodyBytes)))
+		return "", NewAuthenticationError(ErrUserInfoFailed, fmt.Errorf("status %d: %s", status, msg))
+	}
+	if err != nil {
+		return "", NewAuthenticationError(ErrUserInfoFailed, err)
 	}
 
 	var userInfo struct {
 		Login string `json:"login"`
 	}
-	if err = json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
+	if err = json.Unmarshal(bodyBytes, &userInfo); err != nil {
 		return "", NewAuthenticationError(ErrUserInfoFailed, err)
 	}
 

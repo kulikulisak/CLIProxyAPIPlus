@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -11,7 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/browser"
 	// legacy client removed
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/oauthflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -47,94 +48,104 @@ func (a *CodexAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		opts = &LoginOptions{}
 	}
 
-	pkceCodes, err := codex.GeneratePKCECodes()
-	if err != nil {
-		return nil, fmt.Errorf("codex pkce generation failed: %w", err)
-	}
-
-	state, err := misc.GenerateRandomState()
-	if err != nil {
-		return nil, fmt.Errorf("codex state generation failed: %w", err)
-	}
-
-	oauthServer := codex.NewOAuthServer(a.CallbackPort)
-	if err = oauthServer.Start(); err != nil {
-		if strings.Contains(err.Error(), "already in use") {
-			return nil, codex.NewAuthenticationError(codex.ErrPortInUse, err)
-		}
-		return nil, codex.NewAuthenticationError(codex.ErrServerStartFailed, err)
-	}
-	defer func() {
-		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if stopErr := oauthServer.Stop(stopCtx); stopErr != nil {
-			log.Warnf("codex oauth server stop error: %v", stopErr)
-		}
-	}()
-
+	desiredPort := a.CallbackPort
 	authSvc := codex.NewCodexAuth(cfg)
+	provider := codex.NewOAuthProvider(authSvc)
+	flow, err := oauthflow.RunAuthCodeFlow(ctx, provider, oauthflow.AuthCodeFlowOptions{
+		DesiredPort:  desiredPort,
+		CallbackPath: "/auth/callback",
+		Timeout:      5 * time.Minute,
+		OnAuthURL: func(authURL string, callbackPort int, redirectURI string) {
+			if desiredPort != 0 && callbackPort != desiredPort {
+				log.Warnf("codex oauth callback port %d is busy; falling back to an ephemeral port", desiredPort)
+			}
 
-	authURL, err := authSvc.GenerateAuthURL(state, pkceCodes)
+			if !opts.NoBrowser {
+				fmt.Println("Opening browser for Codex authentication")
+				if !browser.IsAvailable() {
+					log.Warn("No browser available; please open the URL manually")
+					util.PrintSSHTunnelInstructions(callbackPort)
+					fmt.Printf("Visit the following URL to continue authentication:\n%s\n", authURL)
+				} else if errOpen := browser.OpenURL(authURL); errOpen != nil {
+					log.Warnf("Failed to open browser automatically: %v", errOpen)
+					util.PrintSSHTunnelInstructions(callbackPort)
+					fmt.Printf("Visit the following URL to continue authentication:\n%s\n", authURL)
+				}
+			} else {
+				util.PrintSSHTunnelInstructions(callbackPort)
+				fmt.Printf("Visit the following URL to continue authentication:\n%s\n", authURL)
+			}
+
+			fmt.Println("Waiting for Codex authentication callback...")
+		},
+	})
 	if err != nil {
-		return nil, fmt.Errorf("codex authorization url generation failed: %w", err)
-	}
-
-	if !opts.NoBrowser {
-		fmt.Println("Opening browser for Codex authentication")
-		if !browser.IsAvailable() {
-			log.Warn("No browser available; please open the URL manually")
-			util.PrintSSHTunnelInstructions(a.CallbackPort)
-			fmt.Printf("Visit the following URL to continue authentication:\n%s\n", authURL)
-		} else if err = browser.OpenURL(authURL); err != nil {
-			log.Warnf("Failed to open browser automatically: %v", err)
-			util.PrintSSHTunnelInstructions(a.CallbackPort)
-			fmt.Printf("Visit the following URL to continue authentication:\n%s\n", authURL)
-		}
-	} else {
-		util.PrintSSHTunnelInstructions(a.CallbackPort)
-		fmt.Printf("Visit the following URL to continue authentication:\n%s\n", authURL)
-	}
-
-	fmt.Println("Waiting for Codex authentication callback...")
-
-	result, err := oauthServer.WaitForCallback(5 * time.Minute)
-	if err != nil {
-		if strings.Contains(err.Error(), "timeout") {
-			return nil, codex.NewAuthenticationError(codex.ErrCallbackTimeout, err)
+		var flowErr *oauthflow.FlowError
+		if errors.As(err, &flowErr) && flowErr != nil {
+			switch flowErr.Kind {
+			case oauthflow.FlowErrorKindPortInUse:
+				return nil, codex.NewAuthenticationError(codex.ErrPortInUse, err)
+			case oauthflow.FlowErrorKindServerStartFailed:
+				return nil, codex.NewAuthenticationError(codex.ErrServerStartFailed, err)
+			case oauthflow.FlowErrorKindAuthorizeURLFailed:
+				return nil, fmt.Errorf("codex authorization url generation failed: %w", flowErr.Err)
+			case oauthflow.FlowErrorKindCallbackTimeout:
+				return nil, codex.NewAuthenticationError(codex.ErrCallbackTimeout, err)
+			case oauthflow.FlowErrorKindProviderError:
+				code := strings.TrimSpace(flow.CallbackError)
+				if code == "" {
+					code = strings.TrimSpace(flowErr.Err.Error())
+				}
+				if code == "" {
+					code = "oauth_error"
+				}
+				return nil, codex.NewOAuthError(code, "", http.StatusBadRequest)
+			case oauthflow.FlowErrorKindInvalidState:
+				return nil, codex.NewAuthenticationError(codex.ErrInvalidState, err)
+			case oauthflow.FlowErrorKindCodeExchangeFailed:
+				return nil, codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, err)
+			}
 		}
 		return nil, err
 	}
-
-	if result.Error != "" {
-		return nil, codex.NewOAuthError(result.Error, "", http.StatusBadRequest)
+	if flow == nil || flow.Token == nil {
+		return nil, fmt.Errorf("codex authentication failed: missing token result")
 	}
 
-	if result.State != state {
-		return nil, codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("state mismatch"))
+	email := ""
+	accountID := ""
+	if flow.Token.Metadata != nil {
+		if raw, ok := flow.Token.Metadata["email"]; ok {
+			if s, okStr := raw.(string); okStr {
+				email = strings.TrimSpace(s)
+			}
+		}
+		if raw, ok := flow.Token.Metadata["account_id"]; ok {
+			if s, okStr := raw.(string); okStr {
+				accountID = strings.TrimSpace(s)
+			}
+		}
 	}
-
-	log.Debug("Codex authorization code received; exchanging for tokens")
-
-	authBundle, err := authSvc.ExchangeCodeForTokens(ctx, result.Code, pkceCodes)
-	if err != nil {
-		return nil, codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, err)
-	}
-
-	tokenStorage := authSvc.CreateTokenStorage(authBundle)
-
-	if tokenStorage == nil || tokenStorage.Email == "" {
+	if email == "" {
 		return nil, fmt.Errorf("codex token storage missing account information")
 	}
 
-	fileName := fmt.Sprintf("codex-%s.json", tokenStorage.Email)
+	tokenStorage := &codex.CodexTokenStorage{
+		IDToken:      flow.Token.IDToken,
+		AccessToken:  flow.Token.AccessToken,
+		RefreshToken: flow.Token.RefreshToken,
+		AccountID:    accountID,
+		LastRefresh:  time.Now().Format(time.RFC3339),
+		Email:        email,
+		Expire:       flow.Token.ExpiresAt,
+	}
+
+	fileName := fmt.Sprintf("codex-%s.json", email)
 	metadata := map[string]any{
-		"email": tokenStorage.Email,
+		"email": email,
 	}
 
 	fmt.Println("Codex authentication successful")
-	if authBundle.APIKey != "" {
-		fmt.Println("Codex API key obtained and stored")
-	}
 
 	return &coreauth.Auth{
 		ID:       fileName,

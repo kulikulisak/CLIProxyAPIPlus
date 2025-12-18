@@ -2,6 +2,7 @@
 package kiro
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/browser"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/oauthhttp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -24,17 +26,17 @@ import (
 const (
 	// AWS SSO OIDC endpoints
 	ssoOIDCEndpoint = "https://oidc.us-east-1.amazonaws.com"
-	
+
 	// Kiro's start URL for Builder ID
 	builderIDStartURL = "https://view.awsapps.com/start"
-	
+
 	// Polling interval
 	pollInterval = 5 * time.Second
-	
+
 	// Authorization code flow callback
 	authCodeCallbackPath = "/oauth/callback"
 	authCodeCallbackPort = 19877
-	
+
 	// User-Agent to match official Kiro IDE
 	kiroUserAgent = "KiroIDE"
 )
@@ -49,7 +51,7 @@ type SSOOIDCClient struct {
 func NewSSOOIDCClient(cfg *config.Config) *SSOOIDCClient {
 	client := &http.Client{Timeout: 30 * time.Second}
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		client = util.SetOAuthProxy(&cfg.SDKConfig, client)
 	}
 	return &SSOOIDCClient{
 		httpClient: client,
@@ -59,10 +61,10 @@ func NewSSOOIDCClient(cfg *config.Config) *SSOOIDCClient {
 
 // RegisterClientResponse from AWS SSO OIDC.
 type RegisterClientResponse struct {
-	ClientID                string `json:"clientId"`
-	ClientSecret            string `json:"clientSecret"`
-	ClientIDIssuedAt        int64  `json:"clientIdIssuedAt"`
-	ClientSecretExpiresAt   int64  `json:"clientSecretExpiresAt"`
+	ClientID              string `json:"clientId"`
+	ClientSecret          string `json:"clientSecret"`
+	ClientIDIssuedAt      int64  `json:"clientIdIssuedAt"`
+	ClientSecretExpiresAt int64  `json:"clientSecretExpiresAt"`
 }
 
 // StartDeviceAuthResponse from AWS SSO OIDC.
@@ -85,6 +87,10 @@ type CreateTokenResponse struct {
 
 // RegisterClient registers a new OIDC client with AWS.
 func (c *SSOOIDCClient) RegisterClient(ctx context.Context) (*RegisterClientResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	payload := map[string]interface{}{
 		"clientName": "Kiro IDE",
 		"clientType": "public",
@@ -97,27 +103,35 @@ func (c *SSOOIDCClient) RegisterClient(ctx context.Context) (*RegisterClientResp
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ssoOIDCEndpoint+"/client/register", strings.NewReader(string(body)))
-	if err != nil {
+	endpoint := ssoOIDCEndpoint + "/client/register"
+	status, _, respBody, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", kiroUserAgent)
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", kiroUserAgent)
 
-	resp, err := c.httpClient.Do(req)
+	if status != http.StatusOK {
+		log.Debugf("register client failed (status %d): %s", status, string(respBody))
+		if err != nil {
+			return nil, fmt.Errorf("register client failed (status %d): %w", status, err)
+		}
+		return nil, fmt.Errorf("register client failed (status %d)", status)
+	}
 	if err != nil {
 		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		log.Debugf("register client failed (status %d): %s", resp.StatusCode, string(respBody))
-		return nil, fmt.Errorf("register client failed (status %d)", resp.StatusCode)
 	}
 
 	var result RegisterClientResponse
@@ -130,6 +144,10 @@ func (c *SSOOIDCClient) RegisterClient(ctx context.Context) (*RegisterClientResp
 
 // StartDeviceAuthorization starts the device authorization flow.
 func (c *SSOOIDCClient) StartDeviceAuthorization(ctx context.Context, clientID, clientSecret string) (*StartDeviceAuthResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	payload := map[string]string{
 		"clientId":     clientID,
 		"clientSecret": clientSecret,
@@ -141,27 +159,35 @@ func (c *SSOOIDCClient) StartDeviceAuthorization(ctx context.Context, clientID, 
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ssoOIDCEndpoint+"/device_authorization", strings.NewReader(string(body)))
-	if err != nil {
+	endpoint := ssoOIDCEndpoint + "/device_authorization"
+	status, _, respBody, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", kiroUserAgent)
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", kiroUserAgent)
 
-	resp, err := c.httpClient.Do(req)
+	if status != http.StatusOK {
+		log.Debugf("start device auth failed (status %d): %s", status, string(respBody))
+		if err != nil {
+			return nil, fmt.Errorf("start device auth failed (status %d): %w", status, err)
+		}
+		return nil, fmt.Errorf("start device auth failed (status %d)", status)
+	}
 	if err != nil {
 		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		log.Debugf("start device auth failed (status %d): %s", resp.StatusCode, string(respBody))
-		return nil, fmt.Errorf("start device auth failed (status %d)", resp.StatusCode)
 	}
 
 	var result StartDeviceAuthResponse
@@ -174,6 +200,10 @@ func (c *SSOOIDCClient) StartDeviceAuthorization(ctx context.Context, clientID, 
 
 // CreateToken polls for the access token after user authorization.
 func (c *SSOOIDCClient) CreateToken(ctx context.Context, clientID, clientSecret, deviceCode string) (*CreateTokenResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	payload := map[string]string{
 		"clientId":     clientID,
 		"clientSecret": clientSecret,
@@ -186,26 +216,28 @@ func (c *SSOOIDCClient) CreateToken(ctx context.Context, clientID, clientSecret,
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ssoOIDCEndpoint+"/token", strings.NewReader(string(body)))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", kiroUserAgent)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
+	endpoint := ssoOIDCEndpoint + "/token"
+	status, _, respBody, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", kiroUserAgent)
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, err
 	}
 
 	// Check for pending authorization
-	if resp.StatusCode == http.StatusBadRequest {
+	if status == http.StatusBadRequest {
 		var errResp struct {
 			Error string `json:"error"`
 		}
@@ -221,9 +253,15 @@ func (c *SSOOIDCClient) CreateToken(ctx context.Context, clientID, clientSecret,
 		return nil, fmt.Errorf("create token failed")
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		log.Debugf("create token failed (status %d): %s", resp.StatusCode, string(respBody))
-		return nil, fmt.Errorf("create token failed (status %d)", resp.StatusCode)
+	if status != http.StatusOK {
+		log.Debugf("create token failed (status %d): %s", status, string(respBody))
+		if err != nil {
+			return nil, fmt.Errorf("create token failed (status %d): %w", status, err)
+		}
+		return nil, fmt.Errorf("create token failed (status %d)", status)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	var result CreateTokenResponse
@@ -236,6 +274,10 @@ func (c *SSOOIDCClient) CreateToken(ctx context.Context, clientID, clientSecret,
 
 // RefreshToken refreshes an access token using the refresh token.
 func (c *SSOOIDCClient) RefreshToken(ctx context.Context, clientID, clientSecret, refreshToken string) (*KiroTokenData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	payload := map[string]string{
 		"clientId":     clientID,
 		"clientSecret": clientSecret,
@@ -248,27 +290,35 @@ func (c *SSOOIDCClient) RefreshToken(ctx context.Context, clientID, clientSecret
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ssoOIDCEndpoint+"/token", strings.NewReader(string(body)))
-	if err != nil {
+	endpoint := ssoOIDCEndpoint + "/token"
+	status, _, respBody, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", kiroUserAgent)
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", kiroUserAgent)
 
-	resp, err := c.httpClient.Do(req)
+	if status != http.StatusOK {
+		log.Debugf("token refresh failed (status %d): %s", status, string(respBody))
+		if err != nil {
+			return nil, fmt.Errorf("token refresh failed (status %d): %w", status, err)
+		}
+		return nil, fmt.Errorf("token refresh failed (status %d)", status)
+	}
 	if err != nil {
 		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		log.Debugf("token refresh failed (status %d): %s", resp.StatusCode, string(respBody))
-		return nil, fmt.Errorf("token refresh failed (status %d)", resp.StatusCode)
 	}
 
 	var result CreateTokenResponse

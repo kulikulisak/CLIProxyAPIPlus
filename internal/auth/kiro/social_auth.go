@@ -3,13 +3,13 @@ package kiro
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +20,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/browser"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/oauthhttp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/term"
@@ -78,7 +79,7 @@ type SocialAuthClient struct {
 func NewSocialAuthClient(cfg *config.Config) *SocialAuthClient {
 	client := &http.Client{Timeout: 30 * time.Second}
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		client = util.SetOAuthProxy(&cfg.SDKConfig, client)
 	}
 	return &SocialAuthClient{
 		httpClient:      client,
@@ -128,34 +129,44 @@ func (c *SocialAuthClient) buildLoginURL(provider, redirectURI, codeChallenge, s
 
 // CreateToken exchanges the authorization code for tokens.
 func (c *SocialAuthClient) CreateToken(ctx context.Context, req *CreateTokenRequest) (*SocialTokenResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal token request: %w", err)
 	}
 
 	tokenURL := kiroAuthServiceEndpoint + "/oauth/token"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(string(body)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create token request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("User-Agent", "cli-proxy-api/1.0.0")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
+	status, _, respBody, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(body))
+			if err != nil {
+				return nil, fmt.Errorf("failed to create token request: %w", err)
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Accept", "application/json")
+			httpReq.Header.Set("User-Agent", "cli-proxy-api/1.0.0")
+			return httpReq, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
-	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read token response: %w", err)
+	if status != http.StatusOK {
+		log.Debugf("token exchange failed (status %d): %s", status, string(respBody))
+		if err != nil {
+			return nil, fmt.Errorf("token exchange failed (status %d): %w", status, err)
+		}
+		return nil, fmt.Errorf("token exchange failed (status %d)", status)
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		log.Debugf("token exchange failed (status %d): %s", resp.StatusCode, string(respBody))
-		return nil, fmt.Errorf("token exchange failed (status %d)", resp.StatusCode)
+	if err != nil {
+		return nil, fmt.Errorf("token request failed: %w", err)
 	}
 
 	var tokenResp SocialTokenResponse
@@ -168,34 +179,44 @@ func (c *SocialAuthClient) CreateToken(ctx context.Context, req *CreateTokenRequ
 
 // RefreshSocialToken refreshes an expired social auth token.
 func (c *SocialAuthClient) RefreshSocialToken(ctx context.Context, refreshToken string) (*KiroTokenData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	body, err := json.Marshal(&RefreshTokenRequest{RefreshToken: refreshToken})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal refresh request: %w", err)
 	}
 
 	refreshURL := kiroAuthServiceEndpoint + "/refreshToken"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, refreshURL, strings.NewReader(string(body)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create refresh request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("User-Agent", "cli-proxy-api/1.0.0")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
+	status, _, respBody, err := oauthhttp.Do(
+		ctx,
+		c.httpClient,
+		func() (*http.Request, error) {
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, refreshURL, bytes.NewReader(body))
+			if err != nil {
+				return nil, fmt.Errorf("failed to create refresh request: %w", err)
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Accept", "application/json")
+			httpReq.Header.Set("User-Agent", "cli-proxy-api/1.0.0")
+			return httpReq, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, fmt.Errorf("refresh request failed: %w", err)
 	}
-	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read refresh response: %w", err)
+	if status != http.StatusOK {
+		log.Debugf("token refresh failed (status %d): %s", status, string(respBody))
+		if err != nil {
+			return nil, fmt.Errorf("token refresh failed (status %d): %w", status, err)
+		}
+		return nil, fmt.Errorf("token refresh failed (status %d)", status)
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		log.Debugf("token refresh failed (status %d): %s", resp.StatusCode, string(respBody))
-		return nil, fmt.Errorf("token refresh failed (status %d)", resp.StatusCode)
+	if err != nil {
+		return nil, fmt.Errorf("refresh request failed: %w", err)
 	}
 
 	var tokenResp SocialTokenResponse
@@ -347,7 +368,7 @@ func (c *SocialAuthClient) LoginWithSocial(ctx context.Context, provider SocialP
 
 	// Try to extract email from JWT access token first
 	email := ExtractEmailFromJWT(tokenResp.AccessToken)
-	
+
 	// If no email in JWT, ask user for account label (only in interactive mode)
 	if email == "" && isInteractiveTerminal() {
 		fmt.Print("\n  Enter account label for file naming (optional, press Enter to skip): ")
@@ -388,7 +409,7 @@ func forceDefaultProtocolHandler() {
 	if runtime.GOOS != "linux" {
 		return // Non-Linux platforms use different handler mechanisms
 	}
-	
+
 	// Set our handler as default using xdg-mime
 	cmd := exec.Command("xdg-mime", "default", "kiro-oauth-handler.desktop", "x-scheme-handler/kiro")
 	if err := cmd.Run(); err != nil {

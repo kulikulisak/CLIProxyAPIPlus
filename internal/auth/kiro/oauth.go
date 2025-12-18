@@ -2,6 +2,7 @@
 package kiro
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,13 +10,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
-	"io"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/oauthhttp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -23,10 +23,10 @@ import (
 const (
 	// Kiro auth endpoint
 	kiroAuthEndpoint = "https://prod.us-east-1.auth.desktop.kiro.dev"
-	
+
 	// Default callback port
 	defaultCallbackPort = 9876
-	
+
 	// Auth timeout
 	authTimeout = 10 * time.Minute
 )
@@ -49,7 +49,7 @@ type KiroOAuth struct {
 func NewKiroOAuth(cfg *config.Config) *KiroOAuth {
 	client := &http.Client{Timeout: 30 * time.Second}
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		client = util.SetOAuthProxy(&cfg.SDKConfig, client)
 	}
 	return &KiroOAuth{
 		httpClient: client,
@@ -172,6 +172,10 @@ func (o *KiroOAuth) LoginWithBuilderIDAuthCode(ctx context.Context) (*KiroTokenD
 
 // exchangeCodeForToken exchanges the authorization code for tokens.
 func (o *KiroOAuth) exchangeCodeForToken(ctx context.Context, code, codeVerifier, redirectURI string) (*KiroTokenData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	payload := map[string]string{
 		"code":          code,
 		"code_verifier": codeVerifier,
@@ -184,28 +188,34 @@ func (o *KiroOAuth) exchangeCodeForToken(ctx context.Context, code, codeVerifier
 	}
 
 	tokenURL := kiroAuthEndpoint + "/oauth/token"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(string(body)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "cli-proxy-api/1.0.0")
-
-	resp, err := o.httpClient.Do(req)
-	if err != nil {
+	status, _, respBody, err := oauthhttp.Do(
+		ctx,
+		o.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(body))
+			if err != nil {
+				return nil, fmt.Errorf("failed to create request: %w", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", "cli-proxy-api/1.0.0")
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
-	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+	if status != http.StatusOK {
+		log.Debugf("token exchange failed (status %d): %s", status, string(respBody))
+		if err != nil {
+			return nil, fmt.Errorf("token exchange failed (status %d): %w", status, err)
+		}
+		return nil, fmt.Errorf("token exchange failed (status %d)", status)
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		log.Debugf("token exchange failed (status %d): %s", resp.StatusCode, string(respBody))
-		return nil, fmt.Errorf("token exchange failed (status %d)", resp.StatusCode)
+	if err != nil {
+		return nil, fmt.Errorf("token request failed: %w", err)
 	}
 
 	var tokenResp KiroTokenResponse
@@ -232,6 +242,10 @@ func (o *KiroOAuth) exchangeCodeForToken(ctx context.Context, code, codeVerifier
 
 // RefreshToken refreshes an expired access token.
 func (o *KiroOAuth) RefreshToken(ctx context.Context, refreshToken string) (*KiroTokenData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	payload := map[string]string{
 		"refreshToken": refreshToken,
 	}
@@ -242,28 +256,34 @@ func (o *KiroOAuth) RefreshToken(ctx context.Context, refreshToken string) (*Kir
 	}
 
 	refreshURL := kiroAuthEndpoint + "/refreshToken"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, refreshURL, strings.NewReader(string(body)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "cli-proxy-api/1.0.0")
-
-	resp, err := o.httpClient.Do(req)
-	if err != nil {
+	status, _, respBody, err := oauthhttp.Do(
+		ctx,
+		o.httpClient,
+		func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, refreshURL, bytes.NewReader(body))
+			if err != nil {
+				return nil, fmt.Errorf("failed to create request: %w", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("User-Agent", "cli-proxy-api/1.0.0")
+			return req, nil
+		},
+		oauthhttp.DefaultRetryConfig(),
+	)
+	if err != nil && status == 0 {
 		return nil, fmt.Errorf("refresh request failed: %w", err)
 	}
-	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+	if status != http.StatusOK {
+		log.Debugf("token refresh failed (status %d): %s", status, string(respBody))
+		if err != nil {
+			return nil, fmt.Errorf("token refresh failed (status %d): %w", status, err)
+		}
+		return nil, fmt.Errorf("token refresh failed (status %d)", status)
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		log.Debugf("token refresh failed (status %d): %s", resp.StatusCode, string(respBody))
-		return nil, fmt.Errorf("token refresh failed (status %d)", resp.StatusCode)
+	if err != nil {
+		return nil, fmt.Errorf("refresh request failed: %w", err)
 	}
 
 	var tokenResp KiroTokenResponse
