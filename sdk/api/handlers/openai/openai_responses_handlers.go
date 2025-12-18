@@ -145,6 +145,13 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
+	}
+
 	// Peek at the first chunk
 	select {
 	case <-c.Request.Context().Done():
@@ -162,10 +169,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	case chunk, ok := <-dataChan:
 		if !ok {
 			// Stream closed without data? Send headers and done.
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-			c.Header("Access-Control-Allow-Origin", "*")
+			setSSEHeaders()
 			_, _ = c.Writer.Write([]byte("\n"))
 			flusher.Flush()
 			cliCancel(nil)
@@ -173,10 +177,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		}
 
 		// Success! Set headers.
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
+		setSSEHeaders()
 
 		// Write first chunk logic (matching forwardResponsesStream)
 		if bytes.HasPrefix(chunk, []byte("event:")) {

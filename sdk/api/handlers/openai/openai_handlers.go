@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -433,6 +434,13 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
+	}
+
 	// Peek at the first chunk to determine success or failure before setting headers
 	select {
 	case <-c.Request.Context().Done():
@@ -450,10 +458,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 	case chunk, ok := <-dataChan:
 		if !ok {
 			// Stream closed without data? Send DONE or just headers.
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-			c.Header("Access-Control-Allow-Origin", "*")
+			setSSEHeaders()
 			_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
 			flusher.Flush()
 			cliCancel(nil)
@@ -461,10 +466,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		}
 
 		// Success! Commit to streaming headers.
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
+		setSSEHeaders()
 
 		_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
 		flusher.Flush()
@@ -527,6 +529,13 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, chatCompletionsJSON, "")
 
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
+	}
+
 	// Peek at the first chunk
 	select {
 	case <-c.Request.Context().Done():
@@ -542,10 +551,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		return
 	case chunk, ok := <-dataChan:
 		if !ok {
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-			c.Header("Access-Control-Allow-Origin", "*")
+			setSSEHeaders()
 			_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
 			flusher.Flush()
 			cliCancel(nil)
@@ -553,10 +559,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		}
 
 		// Success! Set headers.
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
+		setSSEHeaders()
 
 		// Write the first chunk
 		converted := convertChatCompletionsStreamChunkToCompletions(chunk)
@@ -565,82 +568,38 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			flusher.Flush()
 		}
 
-		keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
-		var keepAlive *time.Ticker
-		var keepAliveC <-chan time.Time
-		if keepAliveInterval > 0 {
-			keepAlive = time.NewTicker(keepAliveInterval)
-			defer keepAlive.Stop()
-			keepAliveC = keepAlive.C
-		}
+		done := make(chan struct{})
+		var doneOnce sync.Once
+		stop := func() { doneOnce.Do(func() { close(done) }) }
 
-		// Continue loop
-		for {
-			select {
-			case <-c.Request.Context().Done():
-				cliCancel(c.Request.Context().Err())
-				return
-			case chunk, isOk := <-dataChan:
-				if !isOk {
-					// Prefer surfacing an error if one is pending; otherwise terminate cleanly.
-					select {
-					case errMsg, ok := <-errChan:
-						if ok && errMsg != nil {
-							status := http.StatusInternalServerError
-							if errMsg.StatusCode > 0 {
-								status = errMsg.StatusCode
-							}
-							errText := http.StatusText(status)
-							if errMsg.Error != nil && errMsg.Error.Error() != "" {
-								errText = errMsg.Error.Error()
-							}
-							body := handlers.BuildErrorResponseBody(status, errText)
-							_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
-							flusher.Flush()
-							cliCancel(errMsg.Error)
-							return
-						}
-					default:
-					}
-					_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
-					flusher.Flush()
-					cliCancel()
+		convertedChan := make(chan []byte)
+		go func() {
+			defer close(convertedChan)
+			for {
+				select {
+				case <-done:
 					return
-				}
-				converted := convertChatCompletionsStreamChunkToCompletions(chunk)
-				if converted != nil {
-					_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(converted))
-					flusher.Flush()
-				}
-			case errMsg, isOk := <-errChan:
-				if !isOk {
-					continue
-				}
-				if errMsg != nil {
-					status := http.StatusInternalServerError
-					if errMsg.StatusCode > 0 {
-						status = errMsg.StatusCode
+				case chunk, ok := <-dataChan:
+					if !ok {
+						return
 					}
-					errText := http.StatusText(status)
-					if errMsg.Error != nil && errMsg.Error.Error() != "" {
-						errText = errMsg.Error.Error()
+					converted := convertChatCompletionsStreamChunkToCompletions(chunk)
+					if converted == nil {
+						continue
 					}
-					body := handlers.BuildErrorResponseBody(status, errText)
-					_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
-					flusher.Flush()
+					select {
+					case <-done:
+						return
+					case convertedChan <- converted:
+					}
 				}
-				var execErr error
-				if errMsg != nil {
-					execErr = errMsg.Error
-				}
-				cliCancel(execErr)
-				return
-			case <-keepAliveC:
-				// Keep the client connection alive during long pauses between chunks.
-				_, _ = fmt.Fprint(c.Writer, ": keep-alive\n\n")
-				flusher.Flush()
 			}
-		}
+		}()
+
+		h.handleStreamResult(c, flusher, func(err error) {
+			stop()
+			cliCancel(err)
+		}, convertedChan, errChan)
 	}
 }
 func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {

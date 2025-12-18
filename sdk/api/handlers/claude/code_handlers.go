@@ -206,6 +206,13 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 
 	dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
+	}
+
 	// Peek at the first chunk to determine success or failure before setting headers
 	select {
 	case <-c.Request.Context().Done():
@@ -223,20 +230,14 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	case chunk, ok := <-dataChan:
 		if !ok {
 			// Stream closed without data? Send DONE or just headers.
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-			c.Header("Access-Control-Allow-Origin", "*")
+			setSSEHeaders()
 			flusher.Flush()
 			cliCancel(nil)
 			return
 		}
 
 		// Success! Set headers now.
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
+		setSSEHeaders()
 
 		// Write the first chunk
 		if len(chunk) > 0 {
