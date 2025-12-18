@@ -141,47 +141,6 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	`, authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth table: %w", err)
 	}
-
-	spendTable := s.fullTableName("spend_logs")
-	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
-			request_id TEXT PRIMARY KEY,
-			api_key TEXT,
-			model TEXT,
-			prompt_tokens BIGINT,
-			completion_tokens BIGINT,
-			total_tokens BIGINT,
-			cost DOUBLE PRECISION,
-			requested_at TIMESTAMPTZ DEFAULT NOW(),
-			created_at TIMESTAMPTZ DEFAULT NOW()
-		);
-		CREATE INDEX IF NOT EXISTS idx_spend_logs_api_key ON %s(api_key);
-		CREATE INDEX IF NOT EXISTS idx_spend_logs_requested_at ON %s(requested_at);
-	`, spendTable, spendTable, spendTable)); err != nil {
-		return fmt.Errorf("postgres store: create spend_logs table: %w", err)
-	}
-	return nil
-}
-
-// RecordSpendLog inserts a new spend log record into the database.
-func (s *PostgresStore) RecordSpendLog(ctx context.Context, requestID, apiKey, model string, promptTokens, completionTokens, totalTokens int64, cost float64, requestedAt time.Time) error {
-	query := fmt.Sprintf(`
-		INSERT INTO %s (request_id, api_key, model, prompt_tokens, completion_tokens, total_tokens, cost, requested_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, s.fullTableName("spend_logs"))
-	
-	if requestedAt.IsZero() {
-		requestedAt = time.Now()
-	}
-
-	// If requestID is empty, generate one
-	if requestID == "" {
-		requestID = fmt.Sprintf("req-%d", time.Now().UnixNano())
-	}
-
-	if _, err := s.db.ExecContext(ctx, query, requestID, apiKey, model, promptTokens, completionTokens, totalTokens, cost, requestedAt); err != nil {
-		return fmt.Errorf("postgres store: insert spend log: %w", err)
-	}
 	return nil
 }
 
