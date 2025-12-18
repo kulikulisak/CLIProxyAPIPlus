@@ -103,20 +103,8 @@ func (e *modelCooldownError) Headers() http.Header {
 	return headers
 }
 
-// Pick selects the next available auth for the provider in a round-robin manner.
-func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = ctx
-	_ = opts
-	if len(auths) == 0 {
-		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
-	}
-	if s.cursors == nil {
-		s.cursors = make(map[string]int)
-	}
-	available := make([]*Auth, 0, len(auths))
-	now := time.Now()
-	cooldownCount := 0
-	var earliest time.Time
+func collectAvailable(auths []*Auth, model string, now time.Time) (available []*Auth, cooldownCount int, earliest time.Time) {
+	available = make([]*Auth, 0, len(auths))
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
 		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
@@ -131,6 +119,24 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 			}
 		}
 	}
+	if len(available) > 1 {
+		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	}
+	return available, cooldownCount, earliest
+}
+
+// Pick selects the next available auth for the provider in a round-robin manner.
+func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = ctx
+	_ = opts
+	if len(auths) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+	if s.cursors == nil {
+		s.cursors = make(map[string]int)
+	}
+	now := time.Now()
+	available, cooldownCount, earliest := collectAvailable(auths, model, now)
 	if len(available) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			resetIn := earliest.Sub(now)
@@ -140,10 +146,6 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 			return nil, newModelCooldownError(model, provider, resetIn)
 		}
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
-	}
-	// Make round-robin deterministic even if caller's candidate order is unstable.
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	}
 	key := provider + ":" + model
 	s.mu.Lock()
@@ -166,24 +168,8 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
-	available := make([]*Auth, 0, len(auths))
 	now := time.Now()
-	cooldownCount := 0
-	var earliest time.Time
-	for i := 0; i < len(auths); i++ {
-		candidate := auths[i]
-		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
-		if !blocked {
-			available = append(available, candidate)
-			continue
-		}
-		if reason == blockReasonCooldown {
-			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
-		}
-	}
+	available, cooldownCount, earliest := collectAvailable(auths, model, now)
 	if len(available) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			resetIn := earliest.Sub(now)
@@ -193,10 +179,6 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 			return nil, newModelCooldownError(model, provider, resetIn)
 		}
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
-	}
-	// Make fill-first deterministic even if caller's candidate order is unstable.
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	}
 	return available[0], nil
 }

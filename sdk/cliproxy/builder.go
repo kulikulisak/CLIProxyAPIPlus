@@ -205,8 +205,6 @@ func (b *Builder) Build() (*Service, error) {
 		}
 		var selector coreauth.Selector
 		switch strategy {
-		case "", "fill-first", "fillfirst", "fill_first", "burn-first", "burnfirst", "burn_first", "first":
-			selector = &coreauth.FillFirstSelector{}
 		case "round-robin", "roundrobin", "rr":
 			selector = &coreauth.RoundRobinSelector{}
 		default:
