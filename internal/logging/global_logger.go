@@ -38,7 +38,7 @@ func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 
 	timestamp := entry.Time.Format("2006-01-02 15:04:05")
 	message := strings.TrimRight(entry.Message, "\r\n")
-	
+
 	// Handle nil Caller (can happen with some log entries)
 	callerFile := "unknown"
 	callerLine := 0
@@ -46,7 +46,7 @@ func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 		callerFile = filepath.Base(entry.Caller.File)
 		callerLine = entry.Caller.Line
 	}
-	
+
 	formatted := fmt.Sprintf("[%s] [%s] [%s:%d] %s\n", timestamp, entry.Level, callerFile, callerLine, message)
 	buffer.WriteString(formatted)
 
