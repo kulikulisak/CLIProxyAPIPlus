@@ -125,17 +125,11 @@ func collectAvailable(auths []*Auth, model string, now time.Time) (available []*
 	return available, cooldownCount, earliest
 }
 
-// Pick selects the next available auth for the provider in a round-robin manner.
-func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = ctx
-	_ = opts
+func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
-	if s.cursors == nil {
-		s.cursors = make(map[string]int)
-	}
-	now := time.Now()
+
 	available, cooldownCount, earliest := collectAvailable(auths, model, now)
 	if len(available) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
@@ -146,6 +140,22 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 			return nil, newModelCooldownError(model, provider, resetIn)
 		}
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+
+	return available, nil
+}
+
+// Pick selects the next available auth for the provider in a round-robin manner.
+func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = ctx
+	_ = opts
+	if s.cursors == nil {
+		s.cursors = make(map[string]int)
+	}
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
 	}
 	key := provider + ":" + model
 	s.mu.Lock()
@@ -165,20 +175,10 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = ctx
 	_ = opts
-	if len(auths) == 0 {
-		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
-	}
 	now := time.Now()
-	available, cooldownCount, earliest := collectAvailable(auths, model, now)
-	if len(available) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
-			resetIn := earliest.Sub(now)
-			if resetIn < 0 {
-				resetIn = 0
-			}
-			return nil, newModelCooldownError(model, provider, resetIn)
-		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
 	}
 	return available[0], nil
 }
