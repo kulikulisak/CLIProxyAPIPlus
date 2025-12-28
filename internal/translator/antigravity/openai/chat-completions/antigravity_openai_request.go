@@ -4,7 +4,10 @@ package chat_completions
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
+	"math/big"
+	"regexp"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -14,6 +17,18 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// cleanToolSchema removes unsupported JSON Schema fields that Gemini doesn't accept
+var additionalPropsRegex = regexp.MustCompile(`"additionalProperties"\s*:\s*(true|false)\s*,?`)
+
+func cleanToolSchema(schema string) string {
+	// Remove all "additionalProperties": true/false patterns
+	cleaned := additionalPropsRegex.ReplaceAllString(schema, "")
+	// Clean up any trailing commas before closing braces
+	cleaned = strings.ReplaceAll(cleaned, ",}", "}")
+	cleaned = strings.ReplaceAll(cleaned, ", }", "}")
+	return cleaned
+}
 
 const geminiCLIFunctionThoughtSignature = "skip_thought_signature_validator"
 
@@ -28,12 +43,24 @@ const geminiCLIFunctionThoughtSignature = "skip_thought_signature_validator"
 // Returns:
 //   - []byte: The transformed request data in Gemini CLI API format
 func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
+	log.Debugf("Input OpenAI Request: %s", string(inputRawJSON))
 	rawJSON := bytes.Clone(inputRawJSON)
+
 	// Base envelope (no default thinkingConfig)
 	out := []byte(`{"project":"","request":{"contents":[]},"model":"gemini-2.5-pro"}`)
 
 	// Model
 	out, _ = sjson.SetBytes(out, "model", modelName)
+	includeToolIDs := strings.Contains(strings.ToLower(modelName), "claude")
+	genToolCallID := func() string {
+		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+		var b strings.Builder
+		for i := 0; i < 24; i++ {
+			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+			b.WriteByte(letters[n.Int64()])
+		}
+		return "toolu_" + b.String()
+	}
 
 	// Reasoning effort -> thinkingBudget/include_thoughts
 	// Note: OpenAI official fields take precedence over extra_body.google.thinking_config
@@ -153,9 +180,24 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				tcs := m.Get("tool_calls")
 				if tcs.IsArray() {
 					for _, tc := range tcs.Array() {
-						if tc.Get("type").String() == "function" {
+						// Support both OpenAI format (type:"function") and direct format
+						tcType := tc.Get("type").String()
+						if tcType == "function" || tcType == "" {
 							id := tc.Get("id").String()
 							name := tc.Get("function.name").String()
+							if id != "" && name != "" {
+								tcID2Name[id] = name
+							}
+						}
+					}
+				}
+				// Also check for Anthropic-style tool_use in content
+				content := m.Get("content")
+				if content.IsArray() {
+					for _, item := range content.Array() {
+						if item.Get("type").String() == "tool_use" {
+							id := item.Get("id").String()
+							name := item.Get("name").String()
 							if id != "" && name != "" {
 								tcID2Name[id] = name
 							}
@@ -240,14 +282,63 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 							} else {
 								log.Warnf("Unknown file name extension '%s' in user message, skip", ext)
 							}
+						case "tool_result":
+							// Handle Anthropic-style tool_result -> functionResponse
+							toolID := item.Get("tool_use_id").String()
+							var contentStr string
+
+							// Extract content string from various formats
+							c := item.Get("content")
+							if c.IsArray() {
+								// Anthropic sends array of text/image. We only support text result for now.
+								for _, sub := range c.Array() {
+									if sub.Get("type").String() == "text" {
+										contentStr += sub.Get("text").String()
+									}
+								}
+							} else {
+								contentStr = c.String()
+							}
+
+							if name, ok := tcID2Name[toolID]; ok {
+								// We need to switch role to 'function' for this part?
+								// Gemini v1beta supports role: function. But we are inside a 'user' message loop.
+								// If we mix text and functionResponse in 'user' message, it might fail?
+								// Gemini docs say: "The role must be 'function' if the content is a FunctionResponse."
+								// So we probably need to break this out into a separate message if possible,
+								// OR change the role of THIS message to function if it ONLY contains tool results.
+								// However, assuming mixed content isn't allowed, we try to add it as a part with role='function'
+								// if we could start a new message. But here we are building `parts` for a single message.
+
+								// Actually, earlier logs showed we send separate messages for user query?
+								// Let's try adding it as a part. If mixed roles are problem, we might need more complex logic.
+								// But for now, let's treat it as a functionResponse part.
+								// Wait, functionResponse part is: { "functionResponse": { ... } }
+								// It doesn't have a role INSIDE the part. The MESSAGE has a role.
+								// If the message has role 'user', can it contain 'functionResponse'?
+								// Gemini 1.5 Pro allows role 'user' for function response.
+
+								toolNode := []byte(`{}`)
+								toolNode, _ = sjson.SetBytes(toolNode, "functionResponse.name", name)
+								if includeToolIDs && toolID != "" {
+									toolNode, _ = sjson.SetBytes(toolNode, "functionResponse.id", toolID)
+								}
+								toolNode, _ = sjson.SetBytes(toolNode, "functionResponse.response.result", contentStr) // Use simple result
+
+								// Add as a part
+								node, _ = sjson.SetRawBytes(node, "parts."+itoa(p), toolNode)
+								p++
+							}
 						}
 					}
 				}
 				out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
+			} else if role == "tool" {
+				continue // handled in assistant block
 			} else if role == "assistant" {
 				node := []byte(`{"role":"model","parts":[]}`)
 				p := 0
-				if content.Type == gjson.String && content.String() != "" {
+				if content.Type == gjson.String {
 					node, _ = sjson.SetBytes(node, "parts.-1.text", content.String())
 					p++
 				} else if content.IsArray() {
@@ -255,6 +346,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					for _, item := range content.Array() {
 						switch item.Get("type").String() {
 						case "text":
+							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", item.Get("text").String())
 							p++
 						case "image_url":
 							// If the assistant returned an inline data URL, preserve it for history fidelity.
@@ -269,6 +361,30 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 									p++
 								}
 							}
+						case "tool_use":
+							// Handle Anthropic-style tool_use -> functionCall
+							fname := item.Get("name").String()
+							fargs := item.Get("input").Raw
+							fid := item.Get("id").String()
+							if includeToolIDs && fid == "" {
+								fid = genToolCallID()
+							}
+
+							fcNode := []byte(`{}`)
+							fcNode, _ = sjson.SetBytes(fcNode, "functionCall.name", fname)
+							if includeToolIDs && fid != "" {
+								fcNode, _ = sjson.SetBytes(fcNode, "functionCall.id", fid)
+							}
+
+							// Ensure args is an object
+							if gjson.Valid(fargs) {
+								fcNode, _ = sjson.SetRawBytes(fcNode, "functionCall.args", []byte(fargs))
+							} else {
+								fcNode, _ = sjson.SetBytes(fcNode, "functionCall.args.params", []byte(fargs))
+							}
+
+							node, _ = sjson.SetRawBytes(node, "parts."+itoa(p), fcNode)
+							p++
 						}
 					}
 				}
@@ -278,20 +394,30 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				if tcs.IsArray() {
 					fIDs := make([]string, 0)
 					for _, tc := range tcs.Array() {
-						if tc.Get("type").String() != "function" {
+						// Support both OpenAI format (type:"function") and direct format
+						tcType := tc.Get("type").String()
+						if tcType != "function" && tcType != "" {
 							continue
 						}
 						fid := tc.Get("id").String()
 						fname := tc.Get("function.name").String()
 						fargs := tc.Get("function.arguments").String()
-						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.id", fid)
+						if includeToolIDs && fid == "" {
+							fid = genToolCallID()
+						}
 						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
+						if includeToolIDs && fid != "" {
+							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.id", fid)
+							if fname != "" {
+								tcID2Name[fid] = fname
+							}
+						}
 						if gjson.Valid(fargs) {
 							node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
 						} else {
 							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.args.params", []byte(fargs))
 						}
-						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiCLIFunctionThoughtSignature)
+						// node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiCLIFunctionThoughtSignature) // Unsupported
 						p++
 						if fid != "" {
 							fIDs = append(fIDs, fid)
@@ -300,12 +426,15 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
 
 					// Append a single tool content combining name + response per function
-					toolNode := []byte(`{"role":"user","parts":[]}`)
+					toolNode := []byte(`{"role":"function","parts":[]}`)
 					pp := 0
 					for _, fid := range fIDs {
 						if name, ok := tcID2Name[fid]; ok {
-							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid)
+							// toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid) // Gemini doesn't use ID
 							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", name)
+							if includeToolIDs {
+								toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid)
+							}
 							resp := toolResponses[fid]
 							if resp == "" {
 								resp = "{}"
@@ -334,12 +463,25 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 
 	// tools -> request.tools[0].functionDeclarations + request.tools[0].googleSearch passthrough
 	tools := gjson.GetBytes(rawJSON, "tools")
+	log.Debugf("[TOOLS DEBUG] tools exist: %v, isArray: %v, length: %d", tools.Exists(), tools.IsArray(), len(tools.Array()))
 	if tools.IsArray() && len(tools.Array()) > 0 {
 		toolNode := []byte(`{}`)
 		hasTool := false
 		hasFunction := false
-		for _, t := range tools.Array() {
-			if t.Get("type").String() == "function" {
+		for i, t := range tools.Array() {
+			toolType := t.Get("type").String()
+			if i < 3 {
+				log.Debugf("[TOOLS DEBUG] Tool %d type: '%s', has function: %v", i, toolType, t.Get("function").Exists())
+				if i == 0 {
+					// Log first 500 chars of first tool to see structure
+					raw := t.Raw
+					if len(raw) > 500 {
+						raw = raw[:500]
+					}
+					log.Debugf("[TOOLS DEBUG] Tool 0 raw: %s", raw)
+				}
+			}
+			if toolType == "function" {
 				fn := t.Get("function")
 				if fn.Exists() && fn.IsObject() {
 					fnRaw := fn.Raw
@@ -375,6 +517,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						}
 					}
 					fnRaw, _ = sjson.Delete(fnRaw, "strict")
+					fnRaw, _ = sjson.Delete(fnRaw, "cache_control")
 					if !hasFunction {
 						toolNode, _ = sjson.SetRawBytes(toolNode, "functionDeclarations", []byte("[]"))
 					}
@@ -387,6 +530,56 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					hasFunction = true
 					hasTool = true
 				}
+			} else if t.Get("name").Exists() {
+				// Direct tool format (MCP tools from Cursor): {name, description, parameters/input_schema}
+				// Convert to Gemini functionDeclarations format
+				fnRaw := t.Raw
+
+				// Handle input_schema (Anthropic/MCP format) -> parametersJsonSchema
+				if t.Get("input_schema").Exists() {
+					renamed, errRename := util.RenameKey(fnRaw, "input_schema", "parametersJsonSchema")
+					if errRename != nil {
+						log.Warnf("Failed to rename input_schema for tool '%s': %v", t.Get("name").String(), errRename)
+						// Set default schema
+						fnRaw, _ = sjson.Set(fnRaw, "parametersJsonSchema.type", "object")
+						fnRaw, _ = sjson.SetRaw(fnRaw, "parametersJsonSchema.properties", `{}`)
+						fnRaw, _ = sjson.Delete(fnRaw, "input_schema")
+					} else {
+						fnRaw = renamed
+					}
+				} else if t.Get("parameters").Exists() {
+					// Handle parameters (OpenAI format)
+					renamed, errRename := util.RenameKey(fnRaw, "parameters", "parametersJsonSchema")
+					if errRename != nil {
+						log.Warnf("Failed to rename parameters for direct tool '%s': %v", t.Get("name").String(), errRename)
+						fnRaw, _ = sjson.Set(fnRaw, "parametersJsonSchema.type", "object")
+						fnRaw, _ = sjson.SetRaw(fnRaw, "parametersJsonSchema.properties", `{}`)
+					} else {
+						fnRaw = renamed
+					}
+				} else {
+					// No schema provided, set default
+					fnRaw, _ = sjson.Set(fnRaw, "parametersJsonSchema.type", "object")
+					fnRaw, _ = sjson.SetRaw(fnRaw, "parametersJsonSchema.properties", `{}`)
+				}
+
+				// Clean up unsupported fields
+				fnRaw, _ = sjson.Delete(fnRaw, "strict")
+				fnRaw, _ = sjson.Delete(fnRaw, "cache_control")
+				fnRaw, _ = sjson.Delete(fnRaw, "input_schema")                              // Ensure removed if rename failed
+				fnRaw, _ = sjson.Delete(fnRaw, "parametersJsonSchema.additionalProperties") // Not supported by Gemini
+
+				if !hasFunction {
+					toolNode, _ = sjson.SetRawBytes(toolNode, "functionDeclarations", []byte("[]"))
+				}
+				tmp, errSet := sjson.SetRawBytes(toolNode, "functionDeclarations.-1", []byte(fnRaw))
+				if errSet != nil {
+					log.Warnf("Failed to append direct tool declaration for '%s': %v", t.Get("name").String(), errSet)
+					continue
+				}
+				toolNode = tmp
+				hasFunction = true
+				hasTool = true
 			}
 			if gs := t.Get("google_search"); gs.Exists() {
 				var errSet error
@@ -399,10 +592,44 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			}
 		}
 		if hasTool {
+			// Clean up nested additionalProperties that Gemini doesn't support
+			cleanedToolNode := cleanToolSchema(string(toolNode))
+			log.Debugf("[TOOLS DEBUG] Setting tools in request, toolNode length: %d", len(cleanedToolNode))
 			out, _ = sjson.SetRawBytes(out, "request.tools", []byte("[]"))
-			out, _ = sjson.SetRawBytes(out, "request.tools.0", toolNode)
+			out, _ = sjson.SetRawBytes(out, "request.tools.0", []byte(cleanedToolNode))
+		} else {
+			log.Debugf("[TOOLS DEBUG] No tools to set (hasTool=false)")
 		}
 	}
+
+	// tool_choice -> request.toolConfig.functionCallingConfig
+	if tc := gjson.GetBytes(rawJSON, "tool_choice"); tc.Exists() {
+		mode := ""
+		switch {
+		case tc.Type == gjson.String:
+			switch strings.ToLower(strings.TrimSpace(tc.String())) {
+			case "none":
+				mode = "NONE"
+			case "auto":
+				mode = "AUTO"
+			case "required":
+				mode = "ANY"
+			}
+		case tc.IsObject():
+			if tc.Get("type").String() == "function" {
+				if name := tc.Get("function.name").String(); name != "" {
+					mode = "ANY"
+					out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{name})
+				}
+			}
+		}
+		if mode != "" {
+			out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", mode)
+		}
+	}
+
+	// Log the final request for debugging MCP tool issues
+	log.Debugf("Final Antigravity Request: %s", string(out))
 
 	return common.AttachDefaultSafetySettings(out, "request.safetySettings")
 }
