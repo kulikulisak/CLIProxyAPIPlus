@@ -46,3 +46,8 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+.idea/
+*.log
+cli-proxy-api
+config.yaml
+logs/

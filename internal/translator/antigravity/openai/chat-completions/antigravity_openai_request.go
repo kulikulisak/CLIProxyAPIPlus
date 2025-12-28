@@ -19,14 +19,15 @@ import (
 )
 
 // cleanToolSchema removes unsupported JSON Schema fields that Gemini doesn't accept
-var additionalPropsRegex = regexp.MustCompile(`"additionalProperties"\s*:\s*(true|false)\s*,?`)
+// This regex handles both boolean values (true/false) and object values ({...})
+var additionalPropsRegex = regexp.MustCompile(`"additionalProperties"\s*:\s*(?:true|false|\{[^{}]*\})\s*,?`)
+var trailingCommaRegex = regexp.MustCompile(`,\s*([}\]])`)
 
 func cleanToolSchema(schema string) string {
-	// Remove all "additionalProperties": true/false patterns
+	// Remove all "additionalProperties": true/false/object patterns
 	cleaned := additionalPropsRegex.ReplaceAllString(schema, "")
-	// Clean up any trailing commas before closing braces
-	cleaned = strings.ReplaceAll(cleaned, ",}", "}")
-	cleaned = strings.ReplaceAll(cleaned, ", }", "}")
+	// Clean up any trailing commas before closing braces/brackets using regex
+	cleaned = trailingCommaRegex.ReplaceAllString(cleaned, "$1")
 	return cleaned
 }
 
@@ -56,7 +57,10 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 		var b strings.Builder
 		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+			n, err := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+			if err != nil {
+				panic(fmt.Sprintf("crypto/rand.Int failed: %v", err))
+			}
 			b.WriteByte(letters[n.Int64()])
 		}
 		return "toolu_" + b.String()
