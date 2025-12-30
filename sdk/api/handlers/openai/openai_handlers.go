@@ -62,7 +62,11 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	// Get all available models
 	allModels := h.Models()
 
+	// Get the global registry to look up provider information
+	modelRegistry := registry.GetGlobalRegistry()
+
 	// Filter to only include the 4 required fields: id, object, created, owned_by
+	// Plus the new provided_by field for client-side grouping
 	filteredModels := make([]map[string]any, len(allModels))
 	for i, model := range allModels {
 		filteredModel := map[string]any{
@@ -78,6 +82,13 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 		// Add owned_by field if it exists
 		if ownedBy, exists := model["owned_by"]; exists {
 			filteredModel["owned_by"] = ownedBy
+		}
+
+		// Add provided_by field to indicate which authenticated services provide this model
+		if modelID, ok := model["id"].(string); ok {
+			if providers := modelRegistry.GetModelProviders(modelID); len(providers) > 0 {
+				filteredModel["provided_by"] = providers
+			}
 		}
 
 		filteredModels[i] = filteredModel
