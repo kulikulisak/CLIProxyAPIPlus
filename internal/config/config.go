@@ -127,19 +127,20 @@ type Config struct {
 // Returns the default timeout (10 minutes) if parsing fails or value is empty.
 // Returns 0 if explicitly set to "0" to disable timeout.
 func (cfg *Config) GetRequestTimeout() time.Duration {
+	const defaultRequestTimeout = 10 * time.Minute
 	if cfg == nil {
-		return 10 * time.Minute
+		return defaultRequestTimeout
 	}
 	timeout := strings.TrimSpace(cfg.RequestTimeout)
 	if timeout == "" {
-		return 10 * time.Minute
+		return defaultRequestTimeout
 	}
 	if timeout == "0" {
 		return 0
 	}
 	d, err := time.ParseDuration(timeout)
 	if err != nil {
-		return 10 * time.Minute
+		return defaultRequestTimeout
 	}
 	return d
 }
