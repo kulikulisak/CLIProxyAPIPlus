@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -59,6 +60,11 @@ type Config struct {
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
+
+	// RequestTimeout defines the timeout for upstream provider requests (e.g., "2m", "10m", "600s").
+	// This is especially important for Extended Thinking requests which may take 5-10+ minutes.
+	// Default is "10m" (10 minutes). Set to "0" to disable timeout.
+	RequestTimeout string `yaml:"request-timeout" json:"request-timeout"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
@@ -115,6 +121,27 @@ type Config struct {
 	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// GetRequestTimeout parses the RequestTimeout string and returns a time.Duration.
+// Returns the default timeout (10 minutes) if parsing fails or value is empty.
+// Returns 0 if explicitly set to "0" to disable timeout.
+func (cfg *Config) GetRequestTimeout() time.Duration {
+	if cfg == nil {
+		return 10 * time.Minute
+	}
+	timeout := strings.TrimSpace(cfg.RequestTimeout)
+	if timeout == "" {
+		return 10 * time.Minute
+	}
+	if timeout == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(timeout)
+	if err != nil {
+		return 10 * time.Minute
+	}
+	return d
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -477,6 +504,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.IncognitoBrowser = false // Default to normal browser (AWS uses incognito by force)
+	cfg.RequestTimeout = "10m"   // Default 10 minutes for Extended Thinking support
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.

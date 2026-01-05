@@ -32,11 +32,19 @@ var (
 //   - ctx: The context containing optional RoundTripper
 //   - cfg: The application configuration
 //   - auth: The authentication information
-//   - timeout: The client timeout (0 means no timeout)
+//   - timeout: The client timeout (0 means use cfg.GetRequestTimeout(), use -1 for no timeout)
 //
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
 func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	// If timeout is 0, use the configured request timeout from config
+	if timeout == 0 && cfg != nil {
+		timeout = cfg.GetRequestTimeout()
+	}
+	// Normalize -1 to 0 (no timeout)
+	if timeout < 0 {
+		timeout = 0
+	}
 	// Priority 1: Use auth.ProxyURL if configured
 	var proxyURL string
 	if auth != nil {
