@@ -223,6 +223,43 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
 }
 
+// recordDetail is a helper method for loading persisted records into statistics.
+// It updates aggregates without context-dependent logic (for database loading).
+func (s *RequestStatistics) recordDetail(apiName, modelName string, detail RequestDetail) {
+	if s == nil {
+		return
+	}
+
+	timestamp := detail.Timestamp
+	totalTokens := detail.Tokens.TotalTokens
+	dayKey := timestamp.Format("2006-01-02")
+	hourKey := timestamp.Hour()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.totalRequests++
+	if detail.Failed {
+		s.failureCount++
+	} else {
+		s.successCount++
+	}
+	s.totalTokens += totalTokens
+
+	stats, ok := s.apis[apiName]
+	if !ok {
+		stats = &apiStats{Models: make(map[string]*modelStats)}
+		s.apis[apiName] = stats
+	}
+	s.updateAPIStats(stats, modelName, detail)
+
+	s.requestsByDay[dayKey]++
+	s.requestsByHour[hourKey]++
+	s.tokensByDay[dayKey] += totalTokens
+	s.tokensByHour[hourKey] += totalTokens
+}
+
+
 // Snapshot returns a copy of the aggregated metrics for external consumption.
 func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	result := StatisticsSnapshot{}
