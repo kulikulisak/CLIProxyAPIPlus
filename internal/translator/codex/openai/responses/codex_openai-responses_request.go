@@ -25,6 +25,10 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "temperature")
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "top_p")
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "service_tier")
+	// Codex Responses rejects client-side metadata fields (e.g., Factory safety IDs).
+	rawJSON, _ = sjson.DeleteBytes(rawJSON, "safety_identifier")
+	rawJSON, _ = sjson.DeleteBytes(rawJSON, "prompt_cache_key")
+	rawJSON, _ = sjson.DeleteBytes(rawJSON, "prompt_cache_retention")
 
 	originalInstructions := ""
 	originalInstructionsText := ""
