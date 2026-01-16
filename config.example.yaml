@@ -58,6 +58,14 @@ logs-max-total-size-mb: 0
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 
+# When true, persist usage data to SQLite for survival across server restarts
+# Requires usage-statistics-enabled to be true
+# usage-persistence-enabled: false
+
+# Optional: Override SQLite database file path
+# Default: <writable-path>/data/usage.db
+# usage-database-path: ""
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 proxy-url: ""
 

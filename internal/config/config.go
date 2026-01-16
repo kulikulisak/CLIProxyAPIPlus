@@ -54,6 +54,15 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// UsagePersistenceEnabled enables SQLite persistence for usage data.
+	// When true, usage records are persisted to SQLite and loaded on startup.
+	// Requires UsageStatisticsEnabled to be true.
+	UsagePersistenceEnabled bool `yaml:"usage-persistence-enabled" json:"usage-persistence-enabled"`
+
+	// UsageDatabasePath optionally overrides the SQLite database file path.
+	// Default: <writable-path>/data/usage.db
+	UsageDatabasePath string `yaml:"usage-database-path" json:"usage-database-path"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
