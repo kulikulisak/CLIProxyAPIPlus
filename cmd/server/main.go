@@ -436,6 +436,27 @@ func main() {
 	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 
+	// Initialize SQLite persistence if enabled
+	if cfg.UsageStatisticsEnabled && cfg.UsagePersistenceEnabled {
+		dbPath := cfg.UsageDatabasePath
+		if dbPath == "" {
+			// Default path resolution
+			if base := util.WritablePath(); base != "" {
+				dbPath = filepath.Join(base, "data", "usage.db")
+			} else {
+				dbPath = filepath.Join(wd, "data", "usage.db")
+			}
+		}
+		// Ensure directory exists
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+			log.Fatalf("usage persistence: create directory: %v", err)
+		}
+		if err := usage.EnablePersistence(context.Background(), dbPath); err != nil {
+			log.Fatalf("usage persistence: %v", err)
+		}
+		log.Infof("usage persistence enabled: %s", dbPath)
+	}
+
 	if err = logging.ConfigureLogOutput(cfg); err != nil {
 		log.Errorf("failed to configure log output: %v", err)
 		return
