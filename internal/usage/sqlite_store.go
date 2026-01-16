@@ -13,10 +13,11 @@ import (
 )
 
 // SQLiteStore handles SQLite persistence for usage records.
+// SQLiteStore handles SQLite persistence for usage records.
 type SQLiteStore struct {
 	db     *sql.DB
 	dbPath string
-	mu     sync.Mutex
+	mu     sync.RWMutex
 }
 
 // NewSQLiteStore opens or creates the SQLite database at the given path.
