@@ -117,7 +117,7 @@ func TestResolveTokenForAuth_Antigravity_RefreshesExpiredToken(t *testing.T) {
 	}
 
 	h := &Handler{authManager: manager}
-	token, err := h.resolveTokenForAuth(context.Background(), auth)
+	token, err := h.resolveTokenForAuth(context.Background(), auth, false)
 	if err != nil {
 		t.Fatalf("resolveTokenForAuth: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestResolveTokenForAuth_Antigravity_SkipsRefreshWhenTokenValid(t *testing.T
 		},
 	}
 	h := &Handler{}
-	token, err := h.resolveTokenForAuth(context.Background(), auth)
+	token, err := h.resolveTokenForAuth(context.Background(), auth, false)
 	if err != nil {
 		t.Fatalf("resolveTokenForAuth: %v", err)
 	}

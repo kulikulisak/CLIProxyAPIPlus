@@ -56,6 +56,28 @@ type apiCallResponse struct {
 	Body       string              `json:"body"`
 }
 
+type tokenRefreshError struct {
+	StatusCode int
+	Body       string
+	Err        error
+}
+
+func (e *tokenRefreshError) Error() string {
+	if e == nil {
+		return ""
+	}
+	body := strings.TrimSpace(e.Body)
+	if body == "" {
+		if e.Err != nil {
+			return e.Err.Error()
+		}
+		return "token refresh failed"
+	}
+	return fmt.Sprintf("token refresh failed: status %d: %s", e.StatusCode, body)
+}
+
+func (e *tokenRefreshError) Unwrap() error { return e.Err }
+
 // APICall makes a generic HTTP request on behalf of the management API caller.
 // It is protected by the management middleware.
 //
@@ -147,7 +169,7 @@ func (h *Handler) APICall(c *gin.Context) {
 			continue
 		}
 		if !tokenResolved {
-			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
+			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth, false)
 			tokenResolved = true
 		}
 		if auth != nil && token == "" {
@@ -248,25 +270,25 @@ func tokenValueForAuth(auth *coreauth.Auth) string {
 	return ""
 }
 
-func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) (string, error) {
+func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth, forceRefresh bool) (string, error) {
 	if auth == nil {
 		return "", nil
 	}
 
 	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 	if provider == "gemini-cli" {
-		token, errToken := h.refreshGeminiOAuthAccessToken(ctx, auth)
+		token, errToken := h.refreshGeminiOAuthAccessToken(ctx, auth, forceRefresh)
 		return token, errToken
 	}
 	if provider == "antigravity" {
-		token, errToken := h.refreshAntigravityOAuthAccessToken(ctx, auth)
+		token, errToken := h.refreshAntigravityOAuthAccessToken(ctx, auth, forceRefresh)
 		return token, errToken
 	}
 
 	return tokenValueForAuth(auth), nil
 }
 
-func (h *Handler) refreshGeminiOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
+func (h *Handler) refreshGeminiOAuthAccessToken(ctx context.Context, auth *coreauth.Auth, forceRefresh bool) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -289,6 +311,9 @@ func (h *Handler) refreshGeminiOAuthAccessToken(ctx context.Context, auth *corea
 		if raw, errMarshal := json.Marshal(base); errMarshal == nil {
 			_ = json.Unmarshal(raw, &token)
 		}
+	}
+	if forceRefresh {
+		token.Expiry = time.Now().Add(-1 * time.Hour)
 	}
 
 	if token.AccessToken == "" {
@@ -336,7 +361,7 @@ func (h *Handler) refreshGeminiOAuthAccessToken(ctx context.Context, auth *corea
 	return strings.TrimSpace(currentToken.AccessToken), nil
 }
 
-func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
+func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *coreauth.Auth, forceRefresh bool) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -350,7 +375,7 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 	}
 
 	current := strings.TrimSpace(tokenValueFromMetadata(metadata))
-	if current != "" && !antigravityTokenNeedsRefresh(metadata) {
+	if !forceRefresh && current != "" && !antigravityTokenNeedsRefresh(metadata) {
 		return current, nil
 	}
 
@@ -394,7 +419,10 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 		return "", errRead
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("antigravity oauth token refresh failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		return "", &tokenRefreshError{
+			StatusCode: resp.StatusCode,
+			Body:       string(bodyBytes),
+		}
 	}
 
 	var tokenResp struct {

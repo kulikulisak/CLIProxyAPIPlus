@@ -264,6 +264,29 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 	auths := h.authManager.List()
+
+	validateRaw := strings.ToLower(strings.TrimSpace(c.Query("validate")))
+	if validateRaw != "" && validateRaw != "0" && validateRaw != "false" && validateRaw != "no" && validateRaw != "off" {
+		forceRefresh := true
+		if validateRaw == "soft" {
+			forceRefresh = false
+		}
+		now := time.Now()
+		for _, auth := range auths {
+			if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+				continue
+			}
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			if provider != "antigravity" && provider != "gemini-cli" {
+				continue
+			}
+			checkCtx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+			_, errToken := h.resolveTokenForAuth(checkCtx, auth, forceRefresh)
+			cancel()
+			h.applyLoginCheckResult(c.Request.Context(), auth, errToken == nil, errToken, statusCodeForRefreshError(errToken), now)
+		}
+	}
+
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
@@ -276,6 +299,297 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
 	c.JSON(200, gin.H{"files": files})
+}
+
+type validateAuthFilesRequest struct {
+	AuthIndex string   `json:"auth_index"`
+	Name      string   `json:"name"`
+	Provider  string   `json:"provider"`
+	Providers []string `json:"providers"`
+	All       *bool    `json:"all"`
+	Force     *bool    `json:"force"`
+}
+
+// ValidateAuthFiles checks whether auth entries can still refresh their tokens.
+//
+// Endpoint:
+//
+//	POST /v0/management/auth-files/validate
+//
+// Body (optional JSON):
+//   - auth_index / name: validate a single auth
+//   - provider / providers: validate a subset by provider
+//   - all: when true, validate all (default: true when no filters provided)
+//   - force: when true, forces a refresh check even if access token looks valid (default: true)
+//
+// Note: only providers with refresh support (e.g. "antigravity", "gemini-cli") are actively refreshed.
+func (h *Handler) ValidateAuthFiles(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req validateAuthFilesRequest
+	if errBind := c.ShouldBindJSON(&req); errBind != nil && !errors.Is(errBind, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if v := strings.TrimSpace(c.Query("auth_index")); v != "" && req.AuthIndex == "" {
+		req.AuthIndex = v
+	}
+	if v := strings.TrimSpace(c.Query("name")); v != "" && req.Name == "" {
+		req.Name = v
+	}
+	if v := strings.TrimSpace(c.Query("provider")); v != "" && req.Provider == "" && len(req.Providers) == 0 {
+		req.Provider = v
+	}
+
+	forceRefresh := true
+	if req.Force != nil {
+		forceRefresh = *req.Force
+	} else if raw := strings.TrimSpace(c.Query("force")); raw != "" {
+		switch strings.ToLower(raw) {
+		case "0", "false", "no", "off":
+			forceRefresh = false
+		default:
+			forceRefresh = true
+		}
+	}
+
+	filterAuthIndex := strings.TrimSpace(req.AuthIndex)
+	filterName := strings.TrimSpace(req.Name)
+	filterProvider := strings.ToLower(strings.TrimSpace(req.Provider))
+	filterProviders := make(map[string]struct{})
+	for _, p := range req.Providers {
+		if v := strings.ToLower(strings.TrimSpace(p)); v != "" {
+			filterProviders[v] = struct{}{}
+		}
+	}
+	if filterProvider != "" && len(filterProviders) == 0 {
+		filterProviders[filterProvider] = struct{}{}
+	}
+
+	all := true
+	if req.All != nil {
+		all = *req.All
+	} else if raw := strings.TrimSpace(c.Query("all")); raw != "" {
+		switch strings.ToLower(raw) {
+		case "0", "false", "no", "off":
+			all = false
+		default:
+			all = true
+		}
+	} else if filterAuthIndex != "" || filterName != "" || len(filterProviders) > 0 {
+		all = false
+	}
+
+	matches := func(auth *coreauth.Auth) bool {
+		if auth == nil {
+			return false
+		}
+		auth.EnsureIndex()
+		if filterAuthIndex != "" {
+			return auth.Index == filterAuthIndex
+		}
+		if filterName != "" {
+			return auth.ID == filterName || auth.FileName == filterName
+		}
+		if len(filterProviders) > 0 {
+			_, ok := filterProviders[strings.ToLower(strings.TrimSpace(auth.Provider))]
+			return ok
+		}
+		return all
+	}
+
+	auths := h.authManager.List()
+	selected := make([]*coreauth.Auth, 0, len(auths))
+	for _, auth := range auths {
+		if matches(auth) {
+			selected = append(selected, auth)
+		}
+	}
+	if len(selected) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no matching auth files"})
+		return
+	}
+
+	now := time.Now()
+	reqCtx := c.Request.Context()
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	results := make([]gin.H, len(selected))
+
+	for i, auth := range selected {
+		i := i
+		auth := auth
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			auth.EnsureIndex()
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			supported := provider == "antigravity" || provider == "gemini-cli"
+
+			entry := gin.H{
+				"id":         auth.ID,
+				"auth_index": auth.Index,
+				"name":       strings.TrimSpace(auth.FileName),
+				"provider":   strings.TrimSpace(auth.Provider),
+				"supported":  supported,
+				"checked_at": now,
+			}
+			if entry["name"] == "" {
+				entry["name"] = auth.ID
+			}
+			if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+				entry["skipped"] = true
+				results[i] = entry
+				return
+			}
+
+			if !supported {
+				entry["ok"] = nil
+				entry["status"] = auth.Status
+				entry["status_message"] = auth.StatusMessage
+				results[i] = entry
+				return
+			}
+
+			checkCtx, cancel := context.WithTimeout(reqCtx, 25*time.Second)
+			defer cancel()
+
+			_, errToken := h.resolveTokenForAuth(checkCtx, auth, forceRefresh)
+			statusCode := statusCodeForRefreshError(errToken)
+
+			ok := errToken == nil
+			entry["ok"] = ok
+			if statusCode != 0 {
+				entry["http_status"] = statusCode
+			}
+			if errToken != nil {
+				entry["error"] = truncateStatusDetail(errToken.Error(), 500)
+			}
+
+			h.applyLoginCheckResult(checkCtx, auth, ok, errToken, statusCode, now)
+
+			entry["status"] = auth.Status
+			entry["status_message"] = auth.StatusMessage
+
+			results[i] = entry
+		}()
+	}
+	wg.Wait()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "ok",
+		"checked": len(results),
+		"results": results,
+	})
+}
+
+func truncateStatusDetail(msg string, limit int) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" || limit <= 0 {
+		return msg
+	}
+	if len(msg) <= limit {
+		return msg
+	}
+	return msg[:limit] + "..."
+}
+
+func statusCodeForRefreshError(err error) int {
+	if err == nil {
+		return 0
+	}
+	var refreshErr *tokenRefreshError
+	if errors.As(err, &refreshErr) && refreshErr != nil {
+		return refreshErr.StatusCode
+	}
+	var retrieveErr *oauth2.RetrieveError
+	if errors.As(err, &retrieveErr) && retrieveErr != nil && retrieveErr.Response != nil {
+		return retrieveErr.Response.StatusCode
+	}
+	return 0
+}
+
+func (h *Handler) applyLoginCheckResult(ctx context.Context, auth *coreauth.Auth, ok bool, err error, statusCode int, now time.Time) {
+	if h == nil || h.authManager == nil || auth == nil {
+		return
+	}
+
+	// Avoid clobbering quota-related unavailability when the refresh succeeds.
+	loginRelated := func(msg string) bool {
+		switch strings.ToLower(strings.TrimSpace(msg)) {
+		case "", "unauthorized", "request failed", "transient upstream error":
+			return true
+		default:
+			return false
+		}
+	}
+
+	if ok {
+		auth.LastError = nil
+		auth.NextRetryAfter = time.Time{}
+		auth.UpdatedAt = now
+		auth.LastRefreshedAt = now
+		if auth.Status == coreauth.StatusUnknown || (auth.Status == coreauth.StatusError && loginRelated(auth.StatusMessage)) {
+			auth.Unavailable = false
+			auth.Status = coreauth.StatusActive
+			auth.StatusMessage = ""
+		}
+		_, _ = h.authManager.Update(ctx, auth)
+		return
+	}
+
+	statusMsg := "request failed"
+	nextRetry := time.Time{}
+	retryable := true
+
+	switch statusCode {
+	case 400, 401:
+		statusMsg = "unauthorized"
+		nextRetry = now.Add(30 * time.Minute)
+		retryable = false
+	case 402, 403:
+		statusMsg = "payment_required"
+		nextRetry = now.Add(30 * time.Minute)
+		retryable = false
+	case 404:
+		statusMsg = "not_found"
+		nextRetry = now.Add(12 * time.Hour)
+		retryable = false
+	case 429:
+		statusMsg = "quota exhausted"
+		retryable = true
+	case 408, 500, 502, 503, 504:
+		statusMsg = "transient upstream error"
+		nextRetry = now.Add(1 * time.Minute)
+		retryable = true
+	}
+
+	auth.Unavailable = true
+	auth.Status = coreauth.StatusError
+	auth.StatusMessage = statusMsg
+	auth.NextRetryAfter = nextRetry
+	auth.UpdatedAt = now
+
+	if err != nil {
+		auth.LastError = &coreauth.Error{
+			Message:    truncateStatusDetail(err.Error(), 500),
+			Retryable:  retryable,
+			HTTPStatus: statusCode,
+		}
+	}
+
+	_, _ = h.authManager.Update(ctx, auth)
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
