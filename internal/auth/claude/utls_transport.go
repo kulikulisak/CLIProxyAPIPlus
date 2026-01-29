@@ -5,11 +5,14 @@ package claude
 import (
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	tls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/proxy"
 )
 
 // utlsRoundTripper implements http.RoundTripper using utls with Firefox fingerprint
@@ -19,13 +22,47 @@ type utlsRoundTripper struct {
 	mu sync.Mutex
 	// connections caches HTTP/2 client connections per host
 	connections map[string]*http2.ClientConn
+	// proxyURL is the optional proxy URL from configuration
+	proxyURL string
 }
 
-// newUtlsRoundTripper creates a new utls-based round tripper
-func newUtlsRoundTripper() *utlsRoundTripper {
+// newUtlsRoundTripper creates a new utls-based round tripper with optional proxy support
+func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 	return &utlsRoundTripper{
 		connections: make(map[string]*http2.ClientConn),
+		proxyURL:    proxyURL,
 	}
+}
+
+// dial creates a TCP connection, optionally through a proxy
+func (t *utlsRoundTripper) dial(addr string) (net.Conn, error) {
+	if t.proxyURL == "" {
+		return net.Dial("tcp", addr)
+	}
+
+	proxyParsed, err := url.Parse(t.proxyURL)
+	if err != nil {
+		// Fall back to direct connection if proxy URL is invalid
+		return net.Dial("tcp", addr)
+	}
+
+	if proxyParsed.Scheme == "socks5" {
+		var proxyAuth *proxy.Auth
+		if proxyParsed.User != nil {
+			username := proxyParsed.User.Username()
+			password, _ := proxyParsed.User.Password()
+			proxyAuth = &proxy.Auth{User: username, Password: password}
+		}
+		dialer, err := proxy.SOCKS5("tcp", proxyParsed.Host, proxyAuth, proxy.Direct)
+		if err != nil {
+			return net.Dial("tcp", addr)
+		}
+		return dialer.Dial("tcp", addr)
+	}
+
+	// For HTTP/HTTPS proxies, use direct connection (proxy handled at HTTP level)
+	// Note: HTTP proxies with CONNECT would require more complex handling
+	return net.Dial("tcp", addr)
 }
 
 // RoundTrip implements http.RoundTripper
@@ -53,7 +90,7 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 
 	// Create new TLS connection with Firefox fingerprint
-	conn, err := net.Dial("tcp", addr)
+	conn, err := t.dial(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -84,8 +121,13 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 
 // NewAnthropicHttpClient creates an HTTP client that bypasses TLS fingerprinting
 // for Anthropic domains by using utls with Firefox fingerprint.
-func NewAnthropicHttpClient() *http.Client {
+// It accepts optional SDK configuration for proxy settings.
+func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
+	proxyURL := ""
+	if cfg != nil {
+		proxyURL = cfg.ProxyURL
+	}
 	return &http.Client{
-		Transport: newUtlsRoundTripper(),
+		Transport: newUtlsRoundTripper(proxyURL),
 	}
 }

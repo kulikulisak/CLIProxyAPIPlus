@@ -62,7 +62,7 @@ func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
 	// Use custom HTTP client with Firefox TLS fingerprint to bypass
 	// Cloudflare's bot detection on Anthropic domains
 	return &ClaudeAuth{
-		httpClient: NewAnthropicHttpClient(),
+		httpClient: NewAnthropicHttpClient(&cfg.SDKConfig),
 	}
 }
 
