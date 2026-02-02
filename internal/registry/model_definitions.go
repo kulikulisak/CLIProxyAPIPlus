@@ -110,7 +110,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 	now := int64(1732752000) // 2024-11-27
 	return []*ModelInfo{
 		{
-			ID:                  "gpt-4.1",
+			ID:                  "copilot-gpt-4.1",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -121,7 +121,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			MaxCompletionTokens: 16384,
 		},
 		{
-			ID:                  "gpt-5",
+			ID:                  "copilot-gpt-5",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -133,7 +133,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 		},
 		{
-			ID:                  "gpt-5-mini",
+			ID:                  "copilot-gpt-5-mini",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -145,7 +145,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 		},
 		{
-			ID:                  "gpt-5-codex",
+			ID:                  "copilot-gpt-5-codex",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -157,7 +157,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/responses"},
 		},
 		{
-			ID:                  "gpt-5.1",
+			ID:                  "copilot-gpt-5.1",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -169,7 +169,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 		},
 		{
-			ID:                  "gpt-5.1-codex",
+			ID:                  "copilot-gpt-5.1-codex",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -181,7 +181,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/responses"},
 		},
 		{
-			ID:                  "gpt-5.1-codex-mini",
+			ID:                  "copilot-gpt-5.1-codex-mini",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -193,7 +193,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/responses"},
 		},
 		{
-			ID:                  "gpt-5.1-codex-max",
+			ID:                  "copilot-gpt-5.1-codex-max",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -205,7 +205,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/responses"},
 		},
 		{
-			ID:                  "gpt-5.2",
+			ID:                  "copilot-gpt-5.2",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -217,7 +217,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
 		},
 		{
-			ID:                  "gpt-5.2-codex",
+			ID:                  "copilot-gpt-5.2-codex",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -229,7 +229,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/responses"},
 		},
 		{
-			ID:                  "claude-haiku-4.5",
+			ID:                  "copilot-claude-haiku-4.5",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -241,7 +241,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/chat/completions"},
 		},
 		{
-			ID:                  "claude-opus-4.1",
+			ID:                  "copilot-claude-opus-4.1",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -253,7 +253,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/chat/completions"},
 		},
 		{
-			ID:                  "claude-opus-4.5",
+			ID:                  "copilot-claude-opus-4.5",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -265,7 +265,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/chat/completions"},
 		},
 		{
-			ID:                  "claude-sonnet-4",
+			ID:                  "copilot-claude-sonnet-4",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -277,7 +277,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/chat/completions"},
 		},
 		{
-			ID:                  "claude-sonnet-4.5",
+			ID:                  "copilot-claude-sonnet-4.5",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -289,7 +289,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			SupportedEndpoints:  []string{"/chat/completions"},
 		},
 		{
-			ID:                  "gemini-2.5-pro",
+			ID:                  "copilot-gemini-2.5-pro",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -300,7 +300,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			MaxCompletionTokens: 65536,
 		},
 		{
-			ID:                  "gemini-3-pro-preview",
+			ID:                  "copilot-gemini-3-pro-preview",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -311,7 +311,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			MaxCompletionTokens: 65536,
 		},
 		{
-			ID:                  "gemini-3-flash-preview",
+			ID:                  "copilot-gemini-3-flash-preview",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -322,7 +322,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			MaxCompletionTokens: 65536,
 		},
 		{
-			ID:                  "grok-code-fast-1",
+			ID:                  "copilot-grok-code-fast-1",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
@@ -333,7 +333,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			MaxCompletionTokens: 16384,
 		},
 		{
-			ID:                  "oswe-vscode-prime",
+			ID:                  "copilot-oswe-vscode-prime",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "github-copilot",
